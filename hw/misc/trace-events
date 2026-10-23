@@ -368,7 +368,6 @@ aspeed_sli_read(uint64_t offset, unsigned int size, uint32_t data) "To 0x%" PRIx
 aspeed_sliio_write(uint64_t offset, unsigned int size, uint32_t data) "To 0x%" PRIx64 " of size %u: 0x%" PRIx32
 aspeed_sliio_read(uint64_t offset, unsigned int size, uint32_t data) "To 0x%" PRIx64 " of size %u: 0x%" PRIx32
 
-
 # esp_wifi.c
 esp_wifi_mac_read(uint64_t addr, uint32_t value) "0x%03" PRIx64 " -> 0x%08" PRIx32
 esp_wifi_mac_write(uint64_t addr, uint64_t value) "0x%03" PRIx64 " <- 0x%08" PRIx64

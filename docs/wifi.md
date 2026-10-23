@@ -1,6 +1,7 @@
-# Wi-Fi emulation for ESP32 and ESP32-C3
+# Wi-Fi emulation for ESP32, ESP32-C3 and ESP32-S3
 
-The `esp32` and `esp32c3` machines can emulate the chip's Wi-Fi MAC, so that
+The `esp32`, `esp32c3` and `esp32s3` machines can emulate the chip's Wi-Fi
+MAC, so that
 unmodified ESP-IDF applications using `esp_wifi` run in QEMU: as a station
 joining an access point, as a SoftAP serving clients, and with ESP-NOW between
 several QEMU instances. Traffic leaves the emulated chip through an ordinary
@@ -21,18 +22,26 @@ qemu-system-xtensa -nographic -machine esp32 -m 4M \
     -nic user,model=misc.esp32_wifi
 ```
 
-On the ESP32-C3 use `qemu-system-riscv32 -machine esp32c3` and
-`model=misc.esp32c3_wifi`.
+| Chip | QEMU | NIC model |
+| --- | --- | --- |
+| ESP32 | `qemu-system-xtensa -machine esp32` | `misc.esp32_wifi` |
+| ESP32-C3 | `qemu-system-riscv32 -machine esp32c3` | `misc.esp32c3_wifi` |
+| ESP32-S3 | `qemu-system-xtensa -machine esp32s3` | `misc.esp32s3_wifi` |
 
-The device is only created when a `-nic`/`-netdev` asks for this model. It
-replaces `open_eth` for that network interface; on the ESP32-C3 both use
-interrupt source 0, so only one of them can be present.
+For the other chips see [Chip status](#chip-status).
+
+The device is only created when a `-nic` (or `-net nic`) asks for this
+model. It replaces `open_eth` for that network interface; on the ESP32-C3 and
+ESP32-S3 both use interrupt source 0, so only one of them can be present.
+
+Backends whose options contain dots, such as `dgram`, cannot be given to
+`-nic`; use `-netdev dgram,id=n0,... -net nic,netdev=n0,model=...`.
 
 Give each emulated chip its own MAC address in eFuse, otherwise all of them
 use `00:00:00:00:00:00`:
 
 ```
-tests/esp_wifi/mkefuse.py --chip esp32 02:00:00:00:01:00 efuse.bin
+tests/esp_wifi/mkefuse.py --chip esp32 02:00:00:00:01:00 efuse.bin   # or esp32c3, esp32s3
 qemu-system-xtensa ... \
     -drive file=efuse.bin,if=none,format=raw,id=efuse \
     -global driver=nvram.esp32.efuse,property=drive,value=efuse
@@ -71,7 +80,9 @@ The BSSID of access point N is `12:01:00:c4:0a:5N`.
 The emulated access point answers probe requests, sends beacons on its
 channel, accepts open-system authentication and association, and for WPA2-PSK
 runs the 4-way handshake (PMK from the passphrase, PTK, GTK delivery), so the
-driver installs real keys. Data frames are then translated:
+driver installs real keys. Like a real AP it sends message 1 shortly after the
+association response and retransmits messages 1 and 3 every second, up to four
+times, until the station answers. Data frames are then translated:
 
 - frames from the guest to the AP become Ethernet frames on the netdev,
   source the guest's MAC, destination the final destination;
@@ -89,6 +100,11 @@ traffic, the model emulates a station: it authenticates, associates and, for
 WPA2, completes the 4-way handshake with `client-psk`, then forwards that
 host's Ethernet frames to the SoftAP and the SoftAP's frames back. The guest
 sees one client per host MAC, and serves it DHCP like a real client.
+
+The emulated clients use the AKM the SoftAP offers: WPA2-PSK, or PSK-SHA256
+with protected management frames when the SoftAP requires PMF (the IDF
+`softAP` example does). A WPA3-SAE-only SoftAP is reported with `-d unimp`
+and cannot be joined; build it with `CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT=n`.
 
 Connect the SoftAP to a network where the clients live, for example a `tap`
 interface, a `socket`/`stream` link to another VM, or a `dgram` socket to a
@@ -127,9 +143,9 @@ Connect the instances with a shared netdev, for example:
 ## Architecture
 
 ```
-            hw/misc/esp32_wifi.c          hw/misc/esp32c3_wifi.c
-            register offsets, RX          register offsets, RX
-            header, radio quirks          header, radio quirks
+          hw/misc/esp32_wifi.c        hw/misc/esp32c3_wifi.c (C3 and S3)
+          register offsets, RX        register offsets, RX header,
+          header, radio quirks        radio quirks
                        \                    /
                         hw/misc/esp_wifi.c
      MAC registers, TX slots, RX descriptor chain, interrupts, radio blocks
@@ -240,6 +256,11 @@ modem clock bits.
 | `0xd14` | TX DMA state, as ESP32 `0xd24` | Medium |
 | `0x1320` | PHY TX status | Medium |
 
+The TX complete (`0xcb0`, cleared through `0xcac`) and PHY TX status
+(`0x1320`) offsets are confirmed by traces of ESP-NOW sends; the TX error
+pair (`0xca4`/`0xca8`) is inferred from the ESP32 ordering and has not been
+seen in use.
+
 ### ESP32-C3 radio blocks
 
 | Block | Address | Behaviour | Confidence |
@@ -249,17 +270,63 @@ modem clock bits.
 | Analog (RTC I2C) | `0x6000e000` | `0x00`, `0x48` read `0x00ffffff`; `0x50` reads bits 26:24 set; bits 27:20 of a write to `0x150` are the PLL frequency in MHz above 2400, i.e. `7 + 5·ch` | Medium (channel), Low (rest) |
 | NRX | `0x6001c000` | reads `0xffffffff` | Low |
 | BB | `0x6001d000` | reads `0xffffffff` | Low |
-| Power | `0x60035000` | stored; `0x118`, `0x128` read 0 | Low |
+| WDEV | `0x60035000` | stored; `0x07c` returns random data (the RNG data register, as on the ESP32-S3; the PHY library stalls if it reads 0); `0x118`, `0x128` read 0 | Medium (`0x07c`), Low (rest) |
 
 `SYSCON_WIFI_CLK_EN` (`0x60026014`) and `SYSCON_WIFI_RST_EN` (`0x60026018`)
 read back what was written.
 
+### ESP32-S3
+
+Same MAC as the ESP32-C3, at the same address, with RX interrupt cause
+`0x1004024`. Radio blocks as the ESP32-C3, plus BT (`0x60011000`, stored)
+and PHY (`0x60031000`, reads `0xffffffff`); FE2 reads `0xffffffff`. The RNG
+model keeps the WDEV word `0x07c`. The PHY calibration also waits for the
+temperature sensor: `SENS_SAR_TSENS_CTRL` (`0x60008850`) reports ready with a
+raw value of 104 (about 25 °C).
+
 ### RX control header
 
-ESP32: 28 bytes. ESP32-C3: 48 bytes. Word 0 is common: RSSI in bits 7:0
-(ESP32: dBm + 96; ESP32-C3: dBm), rate 12:8, length 27:16, address filter
+ESP32: 28 bytes. ESP32-C3 and ESP32-S3: 48 bytes. Word 0 is common: RSSI in
+bits 7:0 (ESP32: dBm + 96; ESP32-C3/S3: dBm), rate 12:8, length 27:16, address filter
 matches 31:28. The channel is in bits 19:16 of word 2, the timestamp (µs) in
 word 3, and the length again in the last word, bits 11:0 and 23:12.
+
+## Chip status
+
+| Chip | Emulated by esp-develop | Wi-Fi | Notes |
+| --- | --- | --- | --- |
+| ESP32 | yes | supported | |
+| ESP32-C3 | yes | supported | |
+| ESP32-S3 | yes | supported | Same MAC generation as the ESP32-C3 |
+| ESP32-S2 | no | not ported | No machine to run the driver on |
+| ESP32-C6 | yes | not ported | Wi-Fi 6 MAC and PHY in the modem area at `0x600a0000`–`0x600affff` (802.15.4 at `0x600a3000`), unrelated to the other layouts. The driver first stops on the modem clock check (`MODEM_SYSCON` at `0x600a9800` is not modelled); with that register block stored, PHY calibration polls `0x600ad000` and the MAC is initialised around `0x600a00c0`. |
+
+## Testing
+
+`tests/esp_wifi/run_matrix.py` builds IDF examples and test apps for each IDF
+version and chip, runs them, and writes a report:
+
+```
+tests/esp_wifi/run_matrix.py --idf ~/esp/esp-idf-v6.1 --idf ~/esp/esp-idf-v5.5.6 \
+    --chips esp32,esp32c3,esp32s3 --report report.md
+```
+
+| Test | Source | Pass condition |
+| --- | --- | --- |
+| `station` | `wifi/getting_started/station` | "got ip" |
+| `station_wpa2` | same, WPA2-PSK | "got ip" |
+| `http_request` | `protocols/http_request`, server moved to the host | HTTP 200 |
+| `scan` | `wifi/scan` | three APs, each listed once with its channel, RSSI and auth mode |
+| `softap`, `softap_wpa2` | `wifi/getting_started/softAP` | a host on a `dgram` netdev gets a DHCP lease |
+| `espnow` | `wifi/espnow`, two instances | both receive, unicast exchange, no send error |
+| `espnow_ack`, `espnow_ack_encrypted` | `tests/esp_wifi/apps/espnow_ack` | every frame to the peer acknowledged, every frame to a missing station failed |
+| `iperf` | `wifi/iperf` | TCP and UDP to the host for 60 s, every 5 s interval above 0, no gap over 3 s at the host |
+| `restart` | `tests/esp_wifi/apps/restart` | reconnects after `esp_restart()` during UDP traffic |
+
+Every run keeps its serial log, pcap and `-d unimp` log under
+`--work/runs/<idf>/<chip>/<test>/`. `--icount` repeats the matrix with
+`-icount shift=auto`. The `WifiTests` job in `.github/workflows/build.yml`
+runs the matrix for each IDF version on every push.
 
 ## Debugging
 
@@ -274,11 +341,16 @@ word 3, and the length again in the last word, bits 11:0 and 23:12.
 - No radio modelling: no RSSI variation, interference, airtime, or rate
   adaptation. Frames are delivered after a fixed short delay.
 - One guest station per emulated AP. Up to four emulated SoftAP clients.
-- WPA2-PSK (CCMP) only. No WPA3/SAE, WEP, TKIP, enterprise or PMF.
+- WPA2-PSK (CCMP) only, plus PSK-SHA256 with PMF for the emulated SoftAP
+  clients. No WEP, TKIP or enterprise; the emulated APs do not offer PMF.
 - No 802.11n aggregation, power save buffering or DTIM handling: frames are
   delivered as soon as they arrive.
 - Frames are not encrypted on the netdev; ESP-NOW with encryption works, but
   the tunnel carries clear text.
+- No WPA3-SAE, so a WPA3-only SoftAP cannot be joined by the emulated
+  clients, and the emulated APs offer WPA2-PSK only.
 - Channel decoding relies on the PLL programming sequence; a new PHY library
   that programs the PLL differently will make every AP visible on every
   channel (the model treats an unknown channel as "all").
+- The MAC acknowledges unicast frames as soon as the driver has set its
+  address, as hardware does, even if no application listens yet.

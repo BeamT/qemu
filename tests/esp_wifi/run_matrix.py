@@ -618,16 +618,17 @@ CONFIG_ESP_TASK_WDT_EN=n
             return Result(False, 'no IP')
         time.sleep(2)
         d = ctx.iperf_time
-        interval = re.compile(r'\]\s+(\d+\.\d+)-\s*(\d+\.\d+) sec\s+'
-                              r'(\d+\.\d+) MBytes\s+(\d+\.\d+) Mbits/sec')
+        # IDF < 6.0 prints neither the stream ID nor the transfer size
+        interval = re.compile(r'(\d+\.\d+)-\s*(\d+\.\d+) sec\s+'
+                              r'(?:[\d.]+ MBytes\s+)?(\d+\.\d+) Mbits/sec')
         results = []
         for proto, opt in (('tcp', ''), ('udp', '-u')):
             mark = len(vm.lines)
             start = time.monotonic()
             vm.send(f'iperf -c 10.0.2.2 -p {sink.port} -t {d} -i 5 {opt}')
-            done = vm.wait(rf'\]\s+{d - 5}\.0-\s*{d}\.0 sec', d + 60, mark)
+            done = vm.wait(rf'\b{d - 5}\.0-\s*{d}\.0 sec', d + 60, mark)
             end = time.monotonic()
-            rates = [float(m.group(4)) for line in vm.lines[mark:]
+            rates = [float(m.group(3)) for line in vm.lines[mark:]
                      if (m := interval.search(line)) and
                      float(m.group(2)) - float(m.group(1)) <= 5.0]
             gap = sink.longest_gap(proto, start + 3, end - 1)

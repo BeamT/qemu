@@ -31,10 +31,8 @@ OBJECT_DECLARE_TYPE(EspWifiState, EspWifiClass, ESP_WIFI)
 #define ESP_WIFI_RX_QUEUE_MAX   64
 #define ESP_WIFI_FRAME_MAX      2400
 
-/* Interrupt cause bits, shared by all supported chips. reverse-engineered */
+/* TX done interrupt cause, shared by all supported chips. reverse-engineered */
 #define ESP_WIFI_INT_TX_DONE        0x00000080
-#define ESP_WIFI_INT_TX_COLLISION   0x00000100
-#define ESP_WIFI_INT_TX_TIMEOUT     0x00080000
 
 /* Values of the PHY TX status register. reverse-engineered */
 #define ESP_WIFI_PHY_TX_ACK         0x00000000
@@ -61,7 +59,7 @@ typedef struct EspWifiMacLayout {
     hwaddr rx_last;             /* last descriptor filled */
     hwaddr int_status;
     hwaddr int_clear;
-    hwaddr mac_ctrl;
+    hwaddr mac_ctrl;            /* optional */
     hwaddr txq_error_clear;
     hwaddr txq_error;           /* [15:0] collision, [31:16] timeout */
     hwaddr txq_complete_clear;
@@ -69,7 +67,7 @@ typedef struct EspWifiMacLayout {
     hwaddr tx_config0;          /* slot n at tx_config0 + n * tx_stride */
     hwaddr tx_plcp0;            /* slot 0, bits [31:30] start transmission */
     int tx_stride;
-    hwaddr plcp1_0;             /* slot 0, [11:0] frame length */
+    hwaddr plcp1_0;             /* optional; slot 0, [11:0] frame length */
     int plcp1_stride;
     hwaddr phy_tx_status;       /* 0x2300 when no ACK was received */
     uint32_t mac_ctrl_busy;     /* bits that read back 0 once the MAC stops */
@@ -108,7 +106,6 @@ typedef struct EspWifiFrame {
 typedef enum EspWifiLinkState {
     ESP_WIFI_LINK_NONE,
     ESP_WIFI_LINK_AUTHENTICATED,
-    ESP_WIFI_LINK_ASSOCIATED,
     ESP_WIFI_LINK_HANDSHAKE,    /* waiting for the WPA2 4-way handshake */
     ESP_WIFI_LINK_ESTABLISHED,
 } EspWifiLinkState;
@@ -149,7 +146,6 @@ typedef struct EspWifiClient {
     MACAddr mac;
     EspWifiLinkState link;
     EspWifiRsnKeys keys;
-    uint8_t pmk[32];
     int64_t last_attempt;
     GQueue pending;             /* Ethernet frames waiting for association */
 } EspWifiClient;
@@ -170,7 +166,6 @@ typedef struct EspWifiTxSlot {
     bool busy;
     bool wait_ack;
     int64_t deadline;           /* completion time, or ACK timeout */
-    MACAddr ack_from;
 } EspWifiTxSlot;
 
 struct EspWifiState {
@@ -187,7 +182,6 @@ struct EspWifiState {
     uint32_t rx_cur;            /* next descriptor, 0 when the chain ran out */
     uint8_t own_mac[2][6];
     uint32_t channel;
-    uint64_t tsf_offset;
     uint16_t seq;
 
     QSIMPLEQ_HEAD(, EspWifiFrame) rx_queue;

@@ -25,6 +25,7 @@
 #include "qapi/error.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
+#include "migration/vmstate.h"
 #include "exec/address-spaces.h"
 #include "sysemu/dma.h"
 #include "hw/misc/esp_wifi.h"
@@ -74,7 +75,7 @@ static void esp_wifi_raise(EspWifiState *s, uint32_t cause)
 
 uint64_t esp_wifi_tsf(EspWifiState *s)
 {
-    return qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + s->tsf_offset;
+    return qemu_clock_get_us(QEMU_CLOCK_VIRTUAL);
 }
 
 const uint8_t *esp_wifi_own_mac(EspWifiState *s, int iface)
@@ -393,7 +394,7 @@ static uint64_t esp_wifi_mac_read(void *opaque, hwaddr addr, unsigned size)
         r = s->rx_cur ? s->rx_cur : l->dma_base;
     } else if (addr == l->int_status || addr == l->int_clear) {
         r = s->raw_int;
-    } else if (addr == l->mac_ctrl) {
+    } else if (l->mac_ctrl && addr == l->mac_ctrl) {
         r &= ~l->mac_ctrl_busy;
     }
     esp_wifi_check_known(s, addr, false);
@@ -552,6 +553,7 @@ static void esp_wifi_reset_hold(Object *obj, ResetType type)
 
 static void esp_wifi_realize(DeviceState *dev, Error **errp)
 {
+    ERRP_GUARD();
     EspWifiState *s = ESP_WIFI(dev);
     EspWifiClass *k = esp_wifi_get_class(s);
     const EspWifiMacLayout *l = k->layout;
@@ -624,6 +626,12 @@ static Property esp_wifi_properties[] = {
     DEFINE_PROP_END_OF_LIST(),
 };
 
+/* The frame queues, timers and emulated peers are not migrated */
+static const VMStateDescription vmstate_esp_wifi = {
+    .name = "esp-wifi",
+    .unmigratable = 1,
+};
+
 static void esp_wifi_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -631,6 +639,7 @@ static void esp_wifi_class_init(ObjectClass *klass, void *data)
 
     dc->realize = esp_wifi_realize;
     dc->desc = "Espressif Wi-Fi MAC";
+    dc->vmsd = &vmstate_esp_wifi;
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
     device_class_set_props(dc, esp_wifi_properties);
     rc->phases.hold = esp_wifi_reset_hold;
