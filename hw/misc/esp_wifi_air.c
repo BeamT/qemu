@@ -556,7 +556,9 @@ static const uint8_t *data_payload(const uint8_t *f, size_t len,
         hdr += 2;
     }
     if (fc & WLAN_FC_PROTECTED) {
-        hdr += 8;       /* CCMP header, the MAC does the encryption */
+        /* CCMP header and MIC, which the MAC fills in when encrypting */
+        hdr += 8;
+        len = len >= 8 ? len - 8 : 0;
     }
     if (len < hdr + LLC_SNAP_LEN || memcmp(f + hdr, llc_snap, 6)) {
         return NULL;
@@ -582,13 +584,35 @@ static void send_eth(EspWifiState *s, const uint8_t *dst, const uint8_t *src,
 }
 
 /* Build a data frame carrying an Ethernet payload */
+/*
+ * Build a data frame carrying an Ethernet payload. On a protected link it is
+ * laid out as the MAC hands it over after decryption: CCMP header, clear
+ * text, room for the MIC. reverse-engineered
+ */
 static void wb_data(EspWifiState *s, WBuf *b, uint16_t flags,
                     const uint8_t *a1, const uint8_t *a2, const uint8_t *a3,
-                    const uint8_t *eth, size_t len)
+                    const uint8_t *eth, size_t len, EspWifiRsnKeys *k)
 {
-    wb_hdr(s, b, WLAN_TYPE_DATA, 0, flags, a1, a2, a3);
+    static const uint8_t mic[8];
+    uint8_t ccmp[8];
+
+    wb_hdr(s, b, WLAN_TYPE_DATA, 0, flags | (k ? WLAN_FC_PROTECTED : 0),
+           a1, a2, a3);
+    if (k) {
+        uint64_t pn = ++k->tx_pn;
+
+        ccmp[0] = pn;
+        ccmp[1] = pn >> 8;
+        ccmp[2] = 0;
+        ccmp[3] = 0x20 | ((wlan_is_group(a1) ? 1 : 0) << 6);   /* ExtIV */
+        stl_le_p(ccmp + 4, pn >> 16);
+        wb_put(b, ccmp, 8);
+    }
     wb_put(b, llc_snap, 6);
     wb_put(b, eth + 12, len - 12);      /* EtherType and payload */
+    if (k) {
+        wb_put(b, mic, 8);
+    }
 }
 
 /* Stations joining the guest's SoftAP */
@@ -649,7 +673,7 @@ static void client_flush(EspWifiState *s, EspWifiClient *c)
 
     while ((eth = g_queue_pop_head(&c->pending))) {
         wb_data(s, &b, WLAN_FC_TODS, s->guest_ap.bssid.a, c->mac.a, eth->data,
-                eth->data, eth->len);
+                eth->data, eth->len, s->guest_ap.rsn ? &c->keys : NULL);
         esp_wifi_deliver(s, b.d, b.len, AIR_RSSI);
         g_byte_array_unref(eth);
     }
@@ -979,7 +1003,8 @@ void esp_wifi_air_rx_eth(EspWifiState *s, const uint8_t *buf, size_t len)
             continue;
         }
         if (wlan_is_group(dst) || mac_eq(dst, ap->sta.a)) {
-            wb_data(s, &b, WLAN_FC_FROMDS, dst, ap->bssid.a, src, buf, len);
+            wb_data(s, &b, WLAN_FC_FROMDS, dst, ap->bssid.a, src, buf, len,
+                    ap_rsn(ap) ? &ap->keys : NULL);
             esp_wifi_deliver(s, b.d, b.len, ap->rssi);
         }
         break;
@@ -999,7 +1024,8 @@ void esp_wifi_air_rx_eth(EspWifiState *s, const uint8_t *buf, size_t len)
                                   src[5]);
     }
     if (c->link == ESP_WIFI_LINK_ESTABLISHED) {
-        wb_data(s, &b, WLAN_FC_TODS, s->guest_ap.bssid.a, src, dst, buf, len);
+        wb_data(s, &b, WLAN_FC_TODS, s->guest_ap.bssid.a, src, dst, buf, len,
+                s->guest_ap.rsn ? &c->keys : NULL);
         esp_wifi_deliver(s, b.d, b.len, AIR_RSSI);
         return;
     }

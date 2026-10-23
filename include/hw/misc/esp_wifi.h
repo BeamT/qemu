@@ -119,6 +119,7 @@ typedef struct EspWifiRsnKeys {
     uint8_t snonce[32];
     uint8_t ptk[48];            /* KCK | KEK | TK */
     uint64_t replay;
+    uint64_t tx_pn;
     bool ptk_valid;
 } EspWifiRsnKeys;
 

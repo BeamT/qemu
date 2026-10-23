@@ -332,6 +332,8 @@ static void esp_wifi_tx_start(EspWifiState *s, int slot, uint32_t plcp0)
 
     trace_esp_wifi_tx(slot, len, extract32(plcp1, 0, 12),
                       len >= 2 ? wlan_fc(frame) : 0);
+    /* The length includes room for the FCS, which the MAC computes */
+    len = len > WLAN_FCS_LEN ? len - WLAN_FCS_LEN : 0;
     s->tx[slot].busy = true;
     s->tx[slot].wait_ack = false;
     if (len >= 10 && esp_wifi_air_tx(s, slot, frame, len)) {
