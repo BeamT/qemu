@@ -3,9 +3,11 @@
  *
  * Two instances with MACs 02:00:00:00:01:00 and 02:00:00:00:02:00 send
  * unicast frames to each other, and to 02:00:00:00:99:00, which does not
- * exist. (IDF gives the other interfaces the following addresses, so the
- * base addresses must not be consecutive.) Every frame to the peer must be acknowledged, every frame to the
+ * exist. Every frame to the peer must be acknowledged, every frame to the
  * missing station must fail, and frames from the peer must arrive.
+ *
+ * IDF gives the other interfaces the following addresses, so the base
+ * addresses must not be consecutive.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -29,6 +31,7 @@
 #define MAX_TRIES 300
 
 static QueueHandle_t s_status;
+/* Incremented by the Wi-Fi task, read by app_main */
 static volatile int s_rx;
 
 static void on_sent(const esp_now_send_info_t *info,
