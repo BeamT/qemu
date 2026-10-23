@@ -30,10 +30,14 @@ def esp32_image(mac):
 
 
 def esp32c3_image(mac):
-    # MAC in EFUSE_RD_MAC_SPI_SYS_0/1 (block 1), stored byte reversed. The
-    # ESP32-C3 eFuse image is the full 0x400-byte memory, block 1 at 0x44.
+    # The image holds the read registers from EFUSE_RD_WR_DIS (0x2c) on.
+    # MAC in EFUSE_RD_MAC_SPI_SYS_0/1, byte reversed. Chip revision v0.3 and
+    # eFuse block revision v1.3, as the model sets without an image.
     image = bytearray(0x400)
-    image[0x44:0x4a] = bytes(reversed(mac))
+    image[0x18:0x1e] = bytes(reversed(mac))
+    sys3 = (3 << 18) | (3 << 24)        # WAFER_VER_MINOR_LO, BLK_VERSION_MINOR
+    image[0x24:0x28] = struct.pack('<I', sys3)
+    image[0x40:0x44] = struct.pack('<I', 1)     # BLK_VERSION_MAJOR
     return bytes(image)
 
 

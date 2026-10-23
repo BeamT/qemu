@@ -29,6 +29,7 @@
 #include "net/net.h"
 #include "elf.h"
 #include "hw/misc/esp32c3_reg.h"
+#include "hw/misc/esp32c3_wifi.h"
 #include "hw/misc/esp32c3_rtc_cntl.h"
 #include "hw/misc/esp32c3_cache.h"
 #include "hw/char/esp32c3_uart.h"
@@ -70,6 +71,9 @@ struct Esp32C3MachineState {
     qemu_irq cpu_reset;
 
     DeviceState *eth; /* Ethernet controller */
+    DeviceState *wifi;
+    uint32_t syscon_wifi_clk_en;
+    uint32_t syscon_wifi_rst_en;
     ESP32C3IntMatrixState intmatrix;
     ESP32C3UARTState uart[ESP32C3_UART_COUNT];
     ESP32C3GPIOState gpio;
@@ -96,6 +100,9 @@ struct Esp32C3MachineState {
 #define A_SYSCON_ORIGIN_REG     0x3F8
 /* Temporary macro for generating a random value from register SYSCON_RND_DATA_REG */
 #define A_SYSCON_RND_DATA_REG   0x0B0
+#define A_SYSCON_WIFI_CLK_EN_REG 0x014
+#define A_SYSCON_WIFI_RST_EN_REG 0x018
+#define SYSCON_WIFI_CLK_EN_RESET 0xfffce030
 
 /* Temporary macro to mark the CPU as in non-debugging mode */
 #define A_ASSIST_DEBUG_CORE_0_DEBUG_MODE_REG    0x098
@@ -145,7 +152,13 @@ static bool addr_in_range(hwaddr addr, hwaddr start, hwaddr end)
 
 static uint64_t esp32c3_io_read(void *opaque, hwaddr addr, unsigned int size)
 {
-    if (addr_in_range(addr + ESP32C3_IO_START_ADDR, DR_REG_RTC_I2C_BASE, DR_REG_RTC_I2C_BASE + 0x100)) {
+    Esp32C3MachineState *ms = opaque;
+
+    if (addr + ESP32C3_IO_START_ADDR == DR_REG_SYSCON_BASE + A_SYSCON_WIFI_CLK_EN_REG) {
+        return ms->syscon_wifi_clk_en;
+    } else if (addr + ESP32C3_IO_START_ADDR == DR_REG_SYSCON_BASE + A_SYSCON_WIFI_RST_EN_REG) {
+        return ms->syscon_wifi_rst_en;
+    } else if (addr_in_range(addr + ESP32C3_IO_START_ADDR, DR_REG_RTC_I2C_BASE, DR_REG_RTC_I2C_BASE + 0x100)) {
         return (uint32_t) 0xffffff;
     } else if (addr + ESP32C3_IO_START_ADDR == DR_REG_SYSCON_BASE + A_SYSCON_ORIGIN_REG) {
         /* Return "QEMU" as a 32-bit value */
@@ -170,6 +183,15 @@ static uint64_t esp32c3_io_read(void *opaque, hwaddr addr, unsigned int size)
 
 static void esp32c3_io_write(void *opaque, hwaddr addr, uint64_t value, unsigned int size)
 {
+    Esp32C3MachineState *ms = opaque;
+
+    if (addr + ESP32C3_IO_START_ADDR == DR_REG_SYSCON_BASE + A_SYSCON_WIFI_CLK_EN_REG) {
+        ms->syscon_wifi_clk_en = value;
+        return;
+    } else if (addr + ESP32C3_IO_START_ADDR == DR_REG_SYSCON_BASE + A_SYSCON_WIFI_RST_EN_REG) {
+        ms->syscon_wifi_rst_en = value;
+        return;
+    }
 #if ESP32C3_IO_WARNING
         warn_report("[ESP32-C3] Unsupported write $%08lx = %08lx\n", ESP32C3_IO_START_ADDR + addr, value);
 #endif
@@ -232,6 +254,27 @@ static void esp32c3_init_spi_flash(Esp32C3MachineState *ms, BlockBackend* blk)
                                 qdev_get_gpio_in_named(flash_dev, SSI_GPIO_CS, 0));
 }
 
+
+static void esp32c3_wifi_map_region(void *opaque, hwaddr base, MemoryRegion *mr)
+{
+    /* Above the catch-all I/O region */
+    memory_region_add_subregion_overlap(opaque, base, mr, 1);
+}
+
+static void esp32c3_init_wifi(Esp32C3MachineState *ms)
+{
+    DeviceState *dev = qemu_create_nic_device(TYPE_ESP32C3_WIFI, false, NULL);
+
+    if (!dev) {
+        return;
+    }
+    ms->wifi = dev;
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp_wifi_map(ESP_WIFI(dev), esp32c3_wifi_map_region, get_system_memory());
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in(DEVICE(&ms->intmatrix),
+                                        ETS_WIFI_MAC_INTR_SOURCE));
+}
 
 static void esp32c3_init_openeth(Esp32C3MachineState *ms)
 {
@@ -381,8 +424,9 @@ static void esp32c3_machine_init(MachineState *machine)
 
     qdev_realize(DEVICE(&ms->soc), NULL, &error_fatal);
 
+    ms->syscon_wifi_clk_en = SYSCON_WIFI_CLK_EN_RESET;
     memory_region_init_io(&ms->iomem, OBJECT(&ms->soc), &esp32c3_io_ops,
-                          NULL, "esp32c3.iomem", 0xd1000);
+                          ms, "esp32c3.iomem", 0xd1000);
     memory_region_add_subregion(sys_mem, ESP32C3_IO_START_ADDR, &ms->iomem);
 
 
@@ -447,6 +491,7 @@ static void esp32c3_machine_init(MachineState *machine)
 
     /* Initialize OpenCores Ethernet controller now sicne it requires the interrupt matrix */
     esp32c3_init_openeth(ms);
+    esp32c3_init_wifi(ms);
 
     /* USB Serial JTAG realization */
     {

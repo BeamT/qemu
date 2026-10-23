@@ -145,6 +145,7 @@ static void esp32_wifi_class_init(ObjectClass *klass, void *data)
     k->radio = esp32_wifi_radio;
     k->n_radio = ARRAY_SIZE(esp32_wifi_radio);
     k->rx_ctrl_size = 28;
+    k->rssi_offset = 96;
     k->fill_rx_ctrl = esp32_wifi_fill_rx_ctrl;
     k->mac_reg_known = esp32_wifi_mac_reg_known;
     k->radio_read = esp32_wifi_radio_read;

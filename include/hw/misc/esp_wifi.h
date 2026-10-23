@@ -211,6 +211,8 @@ struct EspWifiClass {
     unsigned n_radio;
     /* Size of the RX control header the chip writes in front of a frame */
     size_t rx_ctrl_size;
+    /* Added to the RSSI in dBm to give the value in the RX control header */
+    int rssi_offset;
     void (*fill_rx_ctrl)(EspWifiState *s, uint8_t *hdr, const EspWifiFrame *f);
     /* Is the MAC register at @addr one the model knows about */
     bool (*mac_reg_known)(hwaddr addr);

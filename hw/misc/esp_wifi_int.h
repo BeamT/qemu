@@ -85,7 +85,8 @@ static inline uint32_t esp_wifi_rx_ctrl_word0(EspWifiState *s,
     const uint8_t *m1 = esp_wifi_own_mac(s, 1);
     uint32_t w = 0;
 
-    w = deposit32(w, 0, 8, (uint8_t)(f->rssi + 96));
+    w = deposit32(w, 0, 8, (uint8_t)(f->rssi +
+                                     ESP_WIFI_GET_CLASS(s)->rssi_offset));
     w = deposit32(w, 8, 5, 11);
     w = deposit32(w, 16, 12, f->len);
     w = deposit32(w, 28, 1, wlan_is_group(a1) || !memcmp(a1, m0, 6));
