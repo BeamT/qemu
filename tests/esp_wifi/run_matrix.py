@@ -43,6 +43,12 @@ CHIPS = {
         'efuse': 'nvram.esp32c3.efuse',
         'wifi': 'misc.esp32c3_wifi',
     },
+    'esp32s3': {
+        'qemu': 'qemu-system-xtensa',
+        'machine': ['-machine', 'esp32s3'],
+        'efuse': 'nvram.esp32s3.efuse',
+        'wifi': 'misc.esp32s3_wifi',
+    },
 }
 
 # Applied to every build: flash modes and sizes the QEMU flash model supports

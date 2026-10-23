@@ -66,7 +66,7 @@ typedef struct EspWifiMacLayout {
     hwaddr txq_error;           /* [15:0] collision, [31:16] timeout */
     hwaddr txq_complete_clear;
     hwaddr txq_complete;
-    hwaddr tx_config0;          /* slot 0, slot n at tx_config0 + n * tx_stride */
+    hwaddr tx_config0;          /* slot n at tx_config0 + n * tx_stride */
     hwaddr tx_plcp0;            /* slot 0, bits [31:30] start transmission */
     int tx_stride;
     hwaddr plcp1_0;             /* slot 0, [11:0] frame length */
@@ -135,6 +135,9 @@ typedef struct EspWifiAp {
     uint8_t pmk[32];
     EspWifiLinkState link;
     EspWifiRsnKeys keys;
+    int eapol_msg;              /* EAPOL-Key message to (re)send, 1 or 3 */
+    int eapol_tries;
+    int64_t eapol_due;
 } EspWifiAp;
 
 /*
@@ -193,6 +196,7 @@ struct EspWifiState {
     QEMUTimer *beacon_timer;
     QEMUTimer *ack_timer;
     QEMUTimer *client_timer;
+    QEMUTimer *eapol_timer;
     EspWifiTxSlot tx[ESP_WIFI_TX_SLOTS];
 
     EspWifiAp ap[ESP_WIFI_MAX_APS];

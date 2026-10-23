@@ -301,7 +301,8 @@ static void esp_wifi_tx_start(EspWifiState *s, int slot, uint32_t plcp0)
     const EspWifiMacLayout *l = layout(s);
     uint8_t frame[ESP_WIFI_FRAME_MAX];
     uint32_t addr = dma_addr(s, plcp0);
-    uint32_t plcp1 = *mac_reg(s, l->plcp1_0 + slot * l->plcp1_stride);
+    uint32_t plcp1 = l->plcp1_0 ?
+                     *mac_reg(s, l->plcp1_0 + slot * l->plcp1_stride) : 0;
     size_t len = 0;
     int i;
 
@@ -425,8 +426,11 @@ static void esp_wifi_mac_write(void *opaque, hwaddr addr, uint64_t value,
         *mac_reg(s, l->txq_complete) &= ~value;
     } else if (addr == l->txq_error_clear) {
         *mac_reg(s, l->txq_error) &= ~value;
-    } else if ((slot = esp_wifi_tx_slot(s, addr)) >= 0 && (value & TX_START)) {
-        esp_wifi_tx_start(s, slot, value);
+    } else if (value & TX_START) {
+        slot = esp_wifi_tx_slot(s, addr);
+        if (slot >= 0) {
+            esp_wifi_tx_start(s, slot, value);
+        }
     }
 }
 
@@ -595,18 +599,24 @@ static void esp_wifi_init(Object *obj)
     esp_wifi_air_init(ESP_WIFI(obj));
 }
 
-#define DEFINE_AP_PROPS(n)                                                   \
-    DEFINE_PROP_STRING("ap" #n "-ssid", EspWifiState, ap[n].ssid),           \
-    DEFINE_PROP_STRING("ap" #n "-psk", EspWifiState, ap[n].psk),             \
-    DEFINE_PROP_UINT32("ap" #n "-channel", EspWifiState, ap[n].channel, 1),  \
-    DEFINE_PROP_INT32("ap" #n "-rssi", EspWifiState, ap[n].rssi, -40)
-
 static Property esp_wifi_properties[] = {
     DEFINE_NIC_PROPERTIES(EspWifiState, conf),
-    DEFINE_AP_PROPS(0),
-    DEFINE_AP_PROPS(1),
-    DEFINE_AP_PROPS(2),
-    DEFINE_AP_PROPS(3),
+    DEFINE_PROP_STRING("ap0-ssid", EspWifiState, ap[0].ssid),
+    DEFINE_PROP_STRING("ap0-psk", EspWifiState, ap[0].psk),
+    DEFINE_PROP_UINT32("ap0-channel", EspWifiState, ap[0].channel, 1),
+    DEFINE_PROP_INT32("ap0-rssi", EspWifiState, ap[0].rssi, -40),
+    DEFINE_PROP_STRING("ap1-ssid", EspWifiState, ap[1].ssid),
+    DEFINE_PROP_STRING("ap1-psk", EspWifiState, ap[1].psk),
+    DEFINE_PROP_UINT32("ap1-channel", EspWifiState, ap[1].channel, 1),
+    DEFINE_PROP_INT32("ap1-rssi", EspWifiState, ap[1].rssi, -40),
+    DEFINE_PROP_STRING("ap2-ssid", EspWifiState, ap[2].ssid),
+    DEFINE_PROP_STRING("ap2-psk", EspWifiState, ap[2].psk),
+    DEFINE_PROP_UINT32("ap2-channel", EspWifiState, ap[2].channel, 1),
+    DEFINE_PROP_INT32("ap2-rssi", EspWifiState, ap[2].rssi, -40),
+    DEFINE_PROP_STRING("ap3-ssid", EspWifiState, ap[3].ssid),
+    DEFINE_PROP_STRING("ap3-psk", EspWifiState, ap[3].psk),
+    DEFINE_PROP_UINT32("ap3-channel", EspWifiState, ap[3].channel, 1),
+    DEFINE_PROP_INT32("ap3-rssi", EspWifiState, ap[3].rssi, -40),
     DEFINE_PROP_STRING("client-psk", EspWifiState, client_psk),
     DEFINE_PROP_UINT32("ack-timeout-us", EspWifiState, ack_timeout_us, 20000),
     DEFINE_PROP_UINT32("beacon-interval", EspWifiState, beacon_interval_tu,

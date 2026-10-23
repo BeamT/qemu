@@ -1,18 +1,21 @@
 /*
- * ESP32-C3 Wi-Fi MAC emulation - chip specific layer
+ * ESP32-C3 and ESP32-S3 Wi-Fi MAC emulation - chip specific layer
  *
- * The ESP32-C3 MAC is a relative of the ESP32 one: the RX side and the
- * address filters sit at the same offsets, the interrupt and TX registers
- * moved. Offsets come from the ESP32-C3 port by lcgamboa and from MMIO traces
- * of the IDF Wi-Fi driver; see docs/wifi.md for confidence levels.
+ * The ESP32-C3 and ESP32-S3 share a MAC that is a relative of the ESP32 one:
+ * the RX side and the address filters sit at the same offsets, the interrupt
+ * and TX registers moved. Offsets come from the ESP32-C3 port by lcgamboa, the
+ * ESP32-S3 port by Martin Johnson and from MMIO traces of the IDF Wi-Fi
+ * driver; see docs/wifi.md for confidence levels.
  *
  * Copyright (c) 2023 lcgamboa
+ * Copyright (c) 2025 Martin Johnson
  * Copyright (c) 2026 Jason Kraus
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #include "qemu/osdep.h"
+#include "qemu/guest-random.h"
 #include "hw/misc/esp32c3_wifi.h"
 #include "esp_wifi_int.h"
 
@@ -48,7 +51,44 @@ static const EspWifiRadioBlock esp32c3_wifi_radio[] = {
     { "ana",  0x6000e000, 0x1000 },
     { "nrx",  0x6001c000, 0x1000, true, 0xffffffff },
     { "bb",   0x6001d000, 0x1000, true, 0xffffffff },
-    { "pwr",  0x60035000, 0x1000 },
+    { "wdev", 0x60035000, 0x1000 },
+};
+
+static const EspWifiMacLayout esp32s3_wifi_layout = {
+    .size = 0x2000,
+    .addr_filter = { 0x040, 0x048 },
+    .rx_ctrl = 0x084,
+    .rx_base = 0x088,
+    .rx_next = 0x08c,
+    .rx_last = 0x090,
+    .int_status = 0xc3c,
+    .int_clear = 0xc40,
+    .txq_error_clear = 0xca4,
+    .txq_error = 0xca8,
+    .txq_complete_clear = 0xcac,
+    .txq_complete = 0xcb0,
+    .tx_config0 = 0xd04,
+    .tx_plcp0 = 0xd08,
+    .tx_stride = -8,
+    .phy_tx_status = 0x1320,
+    .int_rx = 0x1004024,
+    .dma_base = 0x3fc00000,
+    .status = {
+        { 0x084, 0x1, 0x0 },
+        { 0xd14, 0x2, 0x1 },
+    },
+};
+
+static const EspWifiRadioBlock esp32s3_wifi_radio[] = {
+    { "mac",  0x60033000, 0x2000 },
+    { "fe2",  0x60005000, 0x1000, true, 0xffffffff },
+    { "fe",   0x60006000, 0x1000 },
+    { "ana",  0x6000e000, 0x1000 },
+    { "bt",   0x60011000, 0x1000 },
+    { "nrx",  0x6001c000, 0x1000, true, 0xffffffff },
+    { "bb",   0x6001d000, 0x1000, true, 0xffffffff },
+    { "phy",  0x60031000, 0x1000, true, 0xffffffff },
+    { "wdev", 0x60035000, 0x1000 },
 };
 
 static bool esp32c3_wifi_mac_reg_known(hwaddr addr)
@@ -104,8 +144,14 @@ static uint64_t esp32c3_wifi_radio_read(EspWifiState *s,
         if (addr == 0x7c || addr == 0x174) {
             return 0xffffffff;
         }
-    } else if (!strcmp(b->name, "pwr")) {
+    } else if (!strcmp(b->name, "wdev")) {
         switch (addr) {
+        case 0x07c: {                   /* RNG data, as on the ESP32-S3 */
+            uint32_t r;
+
+            qemu_guest_getrandom_nofail(&r, sizeof(r));
+            return r;
+        }
         case 0x118:                     /* pending power events */
         case 0x128:
             return 0;
@@ -149,15 +195,34 @@ static void esp32c3_wifi_class_init(ObjectClass *klass, void *data)
     k->radio_write = esp32c3_wifi_radio_write;
 }
 
+static void esp32s3_wifi_class_init(ObjectClass *klass, void *data)
+{
+    EspWifiClass *k = ESP_WIFI_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    esp32c3_wifi_class_init(klass, data);
+    dc->desc = "ESP32-S3 Wi-Fi MAC";
+    k->layout = &esp32s3_wifi_layout;
+    k->radio = esp32s3_wifi_radio;
+    k->n_radio = ARRAY_SIZE(esp32s3_wifi_radio);
+}
+
 static const TypeInfo esp32c3_wifi_info = {
     .name = TYPE_ESP32C3_WIFI,
     .parent = TYPE_ESP_WIFI,
     .class_init = esp32c3_wifi_class_init,
 };
 
+static const TypeInfo esp32s3_wifi_info = {
+    .name = TYPE_ESP32S3_WIFI,
+    .parent = TYPE_ESP_WIFI,
+    .class_init = esp32s3_wifi_class_init,
+};
+
 static void esp32c3_wifi_register_types(void)
 {
     type_register_static(&esp32c3_wifi_info);
+    type_register_static(&esp32s3_wifi_info);
 }
 
 type_init(esp32c3_wifi_register_types)

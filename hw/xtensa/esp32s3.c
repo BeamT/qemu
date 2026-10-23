@@ -20,6 +20,7 @@
 #include "hw/sysbus.h"
 #include "hw/xtensa/xtensa_memory.h"
 #include "hw/misc/unimp.h"
+#include "hw/misc/esp32c3_wifi.h"
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/qdev-properties.h"
@@ -154,6 +155,7 @@ typedef struct Esp32s3SocState {
     MemoryRegion iomem;
     DWCSDMMCState sdmmc;
     DeviceState *eth;
+    DeviceState *wifi;
     SsiPsramState *psram;
 
     uint32_t requested_reset;
@@ -210,6 +212,9 @@ static void esp32s3_soc_reset(DeviceState *dev)
         device_cold_reset(DEVICE(&s->intmatrix));
         for (int i = 0; i < ESP32S3_UART_COUNT; ++i) {
             device_cold_reset(DEVICE(&s->uart[i]));
+        }
+        if (s->wifi) {
+            device_cold_reset(s->wifi);
         }
     }
     if (s->requested_reset & ESP32S3_SOC_RESET_PROCPU) {
@@ -320,6 +325,34 @@ struct Esp32s3MachineState {
     DeviceState *flash_dev;
 };
 #define TYPE_ESP32S3_MACHINE MACHINE_TYPE_NAME("esp32s3")
+
+static void esp32s3_wifi_map_region(void *opaque, hwaddr base, MemoryRegion *mr)
+{
+    /* Above the catch-all I/O region */
+    memory_region_add_subregion_overlap(opaque, base, mr, 1);
+}
+
+static void esp32s3_init_wifi(Esp32s3SocState *ss)
+{
+    DeviceState *dev = qemu_create_nic_device(TYPE_ESP32S3_WIFI, false, NULL);
+    MemoryRegion *rng;
+
+    if (!dev) {
+        return;
+    }
+    ss->wifi = dev;
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp_wifi_map(ESP_WIFI(dev), esp32s3_wifi_map_region, get_system_memory());
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in(DEVICE(&ss->intmatrix),
+                                        ETS_WIFI_MAC_INTR_SOURCE));
+
+    /* The RNG data register sits in the Wi-Fi WDEV block */
+    rng = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->rng), 0);
+    memory_region_del_subregion(get_system_memory(), rng);
+    memory_region_add_subregion_overlap(get_system_memory(), ESP32S3_RNG_BASE,
+                                        rng, 2);
+}
 
 static void esp32s3_init_openeth(Esp32s3SocState *ms)
 {
@@ -458,8 +491,19 @@ static void esp32s3_soc_realize(DeviceState *dev, Error **errp)
 }
 
 
+/*
+ * Temperature sensor control: conversions complete at once, with a raw value
+ * of 104, about 25 degrees C. The PHY calibration waits for it.
+ */
+#define A_SENS_SAR_TSENS_CTRL   (DR_REG_SENS_BASE + 0x50)
+#define SENS_TSENS_READY        BIT(8)
+#define SENS_TSENS_RAW_25C      104
+
 static uint64_t esp32s3_io_read(void *opaque, hwaddr addr, unsigned int size)
 {
+    if (addr + ESP32S3_IO_START_ADDR == A_SENS_SAR_TSENS_CTRL) {
+        return SENS_TSENS_READY | SENS_TSENS_RAW_25C;
+    }
 #if ESP32S3_IO_WARNING
     warn_report("[ESP32-S3] Unsupported read to $%08lx, size = %i\n", ESP32S3_IO_START_ADDR + addr, size);
 #endif
@@ -780,6 +824,8 @@ static void esp32s3_machine_init(MachineState *machine)
         esp32s3_soc_add_periph_device(sys_mem, &ss->rng, ESP32S3_RNG_BASE);
 
     }
+
+    esp32s3_init_wifi(ss);
 
 
     /* GDMA Realization */

@@ -784,14 +784,13 @@ static void esp32_wifi_map_region(void *opaque, hwaddr base, MemoryRegion *mr)
     MemoryRegion *sys_mem = opaque;
     MemoryRegion *mr_apb = g_new(MemoryRegion, 1);
     g_autofree char *name = g_strdup_printf("%s-apb", memory_region_name(mr));
+    hwaddr apb = base - DR_REG_DPORT_APB_BASE + APB_REG_BASE;
 
     /* Below the other peripherals: the RNG lives in the WDEV block */
     memory_region_add_subregion_overlap(sys_mem, base, mr, -1);
     memory_region_init_alias(mr_apb, memory_region_owner(mr), name, mr, 0,
                              memory_region_size(mr));
-    memory_region_add_subregion_overlap(sys_mem,
-                                        base - DR_REG_DPORT_APB_BASE + APB_REG_BASE,
-                                        mr_apb, -1);
+    memory_region_add_subregion_overlap(sys_mem, apb, mr_apb, -1);
 }
 
 static void esp32_machine_init_wifi(Esp32SocState *ss)

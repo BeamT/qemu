@@ -46,6 +46,9 @@
 #define CLIENT_RETRY_NS         (500 * SCALE_MS)
 #define CLIENT_TICK_NS          (100 * SCALE_MS)
 #define CLIENT_PENDING_MAX      32
+#define EAPOL_FIRST_NS          (10 * SCALE_MS)
+#define EAPOL_RETRY_NS          (1000 * SCALE_MS)
+#define EAPOL_TRIES             4
 
 #define ETH_HLEN                14
 #define ETH_P_EAPOL             0x888e
@@ -278,8 +281,8 @@ static void wpa_ptk(EspWifiRsnKeys *k, const uint8_t *pmk,
         /* label || 0 || context || i */
         uint8_t *prf = data + 2;
 
-        prf[sizeof(label) - 1] = 0;
         memmove(prf + sizeof(label), ctx, 76);
+        prf[sizeof(label) - 1] = 0;
         for (i = 0; i < 3; i++) {
             prf[sizeof(label) + 76] = i;
             hmac(QCRYPTO_HASH_ALGO_SHA1, pmk, 32, prf, sizeof(label) + 77,
@@ -468,7 +471,10 @@ static void ap_send_eapol(EspWifiState *s, EspWifiAp *ap, int msg)
     wb_hdr(s, &b, WLAN_TYPE_DATA, 0, WLAN_FC_FROMDS, ap->sta.a, ap->bssid.a,
            ap->bssid.a);
     if (msg == 1) {
-        qemu_guest_getrandom_nofail(k->anonce, sizeof(k->anonce));
+        /* Retransmissions keep the ANonce */
+        if (!ap->eapol_tries) {
+            qemu_guest_getrandom_nofail(k->anonce, sizeof(k->anonce));
+        }
         k->ptk_valid = false;
         info = key_version(k) | KEY_INFO_PAIRWISE | KEY_INFO_ACK;
         wb_eapol_key(&b, info, ++k->replay, k->anonce, NULL, 0, &eapol_len);
@@ -502,6 +508,60 @@ static void ap_send_eapol(EspWifiState *s, EspWifiAp *ap, int msg)
     esp_wifi_deliver(s, b.d, b.len, ap->rssi);
 }
 
+static void ap_eapol_rearm(EspWifiState *s)
+{
+    int64_t next = INT64_MAX;
+    int i;
+
+    for (i = 0; i < ESP_WIFI_MAX_APS; i++) {
+        if (s->ap[i].eapol_msg) {
+            next = MIN(next, s->ap[i].eapol_due);
+        }
+    }
+    if (next == INT64_MAX) {
+        timer_del(s->eapol_timer);
+    } else {
+        timer_mod(s->eapol_timer, next);
+    }
+}
+
+/*
+ * Send message 1 or 3 of the 4-way handshake after @delay, and again every
+ * second until the station answers, as access points do.
+ */
+static void ap_eapol_schedule(EspWifiState *s, EspWifiAp *ap, int msg,
+                              int64_t delay)
+{
+    ap->eapol_msg = msg;
+    ap->eapol_tries = 0;
+    ap->eapol_due = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay;
+    ap_eapol_rearm(s);
+}
+
+static void esp_wifi_eapol_timer(void *opaque)
+{
+    EspWifiState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int i;
+
+    for (i = 0; i < ESP_WIFI_MAX_APS; i++) {
+        EspWifiAp *ap = &s->ap[i];
+
+        if (!ap->eapol_msg || ap->eapol_due > now) {
+            continue;
+        }
+        if (ap->link != ESP_WIFI_LINK_HANDSHAKE ||
+            ap->eapol_tries >= EAPOL_TRIES) {
+            ap->eapol_msg = 0;
+            continue;
+        }
+        ap_send_eapol(s, ap, ap->eapol_msg);
+        ap->eapol_tries++;
+        ap->eapol_due = now + EAPOL_RETRY_NS;
+    }
+    ap_eapol_rearm(s);
+}
+
 static void ap_rx_eapol(EspWifiState *s, EspWifiAp *ap, const uint8_t *eapol,
                         size_t len)
 {
@@ -525,10 +585,11 @@ static void ap_rx_eapol(EspWifiState *s, EspWifiAp *ap, const uint8_t *eapol,
                           "MIC mismatch, wrong passphrase?\n", ap->ssid);
             return;
         }
-        ap_send_eapol(s, ap, 3);
+        ap_eapol_schedule(s, ap, 3, 0);
     } else if (k->ptk_valid && eapol_mic_ok(k, eapol, len)) {
         /* Message 4 */
         trace_esp_wifi_eapol("ap", 4);
+        ap->eapol_msg = 0;
         ap->link = ESP_WIFI_LINK_ESTABLISHED;
         trace_esp_wifi_link(ap->ssid, ap->link);
     }
@@ -569,7 +630,7 @@ static void ap_rx_mgmt(EspWifiState *s, EspWifiAp *ap, unsigned subtype,
             ap->link = ESP_WIFI_LINK_HANDSHAKE;
             ap->keys.replay = 0;
             ap->keys.akm = 2;
-            ap_send_eapol(s, ap, 1);
+            ap_eapol_schedule(s, ap, 1, EAPOL_FIRST_NS);
         } else {
             ap->link = ESP_WIFI_LINK_ESTABLISHED;
         }
@@ -953,9 +1014,9 @@ static void guest_ap_beacon(EspWifiState *s, const uint8_t *f, size_t len)
     g->valid = true;
     trace_esp_wifi_guest_ap(g->ssid, g->channel, rsn, g->akm, g->rsn_caps);
     if (rsn && !g->akm) {
-        qemu_log_mask(LOG_UNIMP, "esp_wifi: SoftAP '%s' offers neither WPA2-PSK "
-                      "nor PSK-SHA256, its clients cannot be emulated\n",
-                      g->ssid);
+        qemu_log_mask(LOG_UNIMP, "esp_wifi: SoftAP '%s' offers neither "
+                      "WPA2-PSK nor PSK-SHA256, its clients cannot be "
+                      "emulated\n", g->ssid);
     } else if (rsn) {
         if (!s->client_psk || !wpa_pmk(s->client_psk, g->ssid, g->pmk)) {
             qemu_log_mask(LOG_GUEST_ERROR, "esp_wifi: SoftAP '%s' uses WPA2, "
@@ -1060,12 +1121,14 @@ bool esp_wifi_air_tx(EspWifiState *s, int slot, const uint8_t *f, size_t len)
             guest_ap_beacon(s, f, len);
             return false;
         }
-        if ((ap = ap_by_bssid(s, a1))) {
+        ap = ap_by_bssid(s, a1);
+        if (ap) {
             ap_rx_mgmt(s, ap, subtype, f, len);
             return false;
         }
-        if (s->guest_ap.valid && mac_eq(a2, s->guest_ap.bssid.a) &&
-            (c = client_find(s, a1))) {
+        c = s->guest_ap.valid && mac_eq(a2, s->guest_ap.bssid.a) ?
+            client_find(s, a1) : NULL;
+        if (c) {
             client_rx_mgmt(s, c, subtype, f, len);
             return false;
         }
@@ -1084,7 +1147,8 @@ bool esp_wifi_air_tx(EspWifiState *s, int slot, const uint8_t *f, size_t len)
     if (!payload) {
         return false;
     }
-    if ((fc & WLAN_FC_TODS) && (ap = ap_by_bssid(s, a1))) {
+    ap = (fc & WLAN_FC_TODS) ? ap_by_bssid(s, a1) : NULL;
+    if (ap) {
         if (ethertype == ETH_P_EAPOL) {
             ap_rx_eapol(s, ap, payload, plen);
         } else if (ap->link == ESP_WIFI_LINK_ESTABLISHED) {
@@ -1182,8 +1246,10 @@ void esp_wifi_air_reset(EspWifiState *s)
 
     for (i = 0; i < ESP_WIFI_MAX_APS; i++) {
         s->ap[i].link = ESP_WIFI_LINK_NONE;
+        s->ap[i].eapol_msg = 0;
         memset(&s->ap[i].keys, 0, sizeof(s->ap[i].keys));
     }
+    timer_del(s->eapol_timer);
     for (i = 0; i < ESP_WIFI_MAX_CLIENTS; i++) {
         client_reset(&s->client[i]);
     }
@@ -1233,6 +1299,7 @@ void esp_wifi_air_realize(EspWifiState *s, Error **errp)
                                    s);
     s->client_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp_wifi_client_timer,
                                    s);
+    s->eapol_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp_wifi_eapol_timer, s);
 }
 
 void esp_wifi_air_init(EspWifiState *s)
