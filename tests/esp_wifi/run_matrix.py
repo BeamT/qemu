@@ -370,9 +370,11 @@ class Builder:
             'build', 'managed_components', 'sdkconfig', 'dependencies.lock'))
         for f in proj.glob('sdkconfig.ci*'):
             f.unlink()
-        defaults = proj / 'sdkconfig.defaults'
-        old = defaults.read_text() if defaults.exists() else ''
-        defaults.write_text(old + COMMON_SDKCONFIG + sdkconfig)
+        # The chip specific file is applied last, so override it too
+        for defaults in (proj / 'sdkconfig.defaults',
+                         proj / f'sdkconfig.defaults.{chip}'):
+            old = defaults.read_text() if defaults.exists() else ''
+            defaults.write_text(old + COMMON_SDKCONFIG + sdkconfig)
         if patch:
             patch(proj)
         # esptool v5 (IDF >= 6.0) renamed merge_bin and its options
@@ -609,33 +611,31 @@ CONFIG_ESP_TASK_WDT_EN=n
         if vm.wait(r'(got ip|GOT_IP|sta ip:|IP_EVENT_STA_GOT_IP)', 60) is None:
             return Result(False, 'no IP')
         time.sleep(2)
-        duration = ctx.iperf_time
+        d = ctx.iperf_time
+        interval = re.compile(r'\]\s+(\d+\.\d+)-\s*(\d+\.\d+) sec\s+'
+                              r'(\d+\.\d+) MBytes\s+(\d+\.\d+) Mbits/sec')
         results = []
-        for proto, args in (('tcp', ''),):
+        for proto, opt in (('tcp', ''), ('udp', '-u')):
             mark = len(vm.lines)
             start = time.monotonic()
-            vm.send(f'iperf -c 10.0.2.2 -p {sink.port} -t {duration} '
-                    f'-i 5 {args}')
-            vm.wait(r'0\.0-\s*\d+\.\d+ sec|\d+\.\d+-\s*%d\.\d+ sec' % duration,
-                    duration + 60, mark)
+            vm.send(f'iperf -c 10.0.2.2 -p {sink.port} -t {d} -i 5 {opt}')
+            done = vm.wait(rf'\]\s+{d - 5}\.0-\s*{d}\.0 sec', d + 60, mark)
             end = time.monotonic()
-            gap = sink.longest_gap(proto, start + 2, end - 2)
+            rates = [float(m.group(4)) for line in vm.lines[mark:]
+                     if (m := interval.search(line)) and
+                     float(m.group(2)) - float(m.group(1)) <= 5.0]
+            gap = sink.longest_gap(proto, start + 3, end - 1)
             total = sum(sink.bytes[proto].values())
-            results.append((proto, total, gap))
-        mark = len(vm.lines)
-        vm.send(f'iperf -c 10.0.2.2 -p {sink.port} -u -t {duration} -i 5 '
-                f'-b 2')
-        vm.wait(r'\d+\.\d+-\s*%d\.\d+ sec' % duration, duration + 60, mark)
-        udp_lines = [line for line in vm.lines[mark:]
-                     if re.search(r'\d+\.\d+-\s*\d+\.\d+ sec', line)]
-        stalled = [line for line in udp_lines
-                   if re.search(r' 0\.00 [MK]?bits/sec', line)]
-        detail = ', '.join(f'{p} {t / 1e6:.1f} MB longest stall {g}s'
-                           for p, t, g in results)
-        detail += f', udp intervals {len(udp_lines)} stalled {len(stalled)}'
-        ok = all(t > 0 and g <= 3 for _, t, g in results) and \
-            len(udp_lines) >= duration // 5 and not stalled
-        return Result(ok, detail)
+            ok = (done is not None and len(rates) >= d // 5 and
+                  min(rates, default=0) > 0 and gap <= 3)
+            results.append((proto, ok, rates, total, gap))
+            time.sleep(3)
+        detail = '; '.join(
+            f'{p} {"ok" if ok else "FAIL"}: {len(r)} intervals '
+            f'{min(r, default=0):.1f}-{max(r, default=0):.1f} Mbit/s, '
+            f'host got {t / 1e6:.1f} MB, longest gap {g}s'
+            for p, ok, r, t, g in results)
+        return Result(all(ok for _, ok, *_ in results), detail)
     finally:
         sink.close()
 
