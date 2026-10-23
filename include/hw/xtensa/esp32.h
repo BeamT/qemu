@@ -53,6 +53,7 @@ typedef struct Esp32SocState {
 
     DWCSDMMCState sdmmc;
     DeviceState *eth;
+    DeviceState *wifi;
 
     BusState rtc_bus;
     BusState periph_bus;

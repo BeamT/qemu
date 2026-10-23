@@ -20,6 +20,7 @@
 #include "hw/i2c/esp32_i2c.h"
 #include "hw/xtensa/xtensa_memory.h"
 #include "hw/misc/unimp.h"
+#include "hw/misc/esp32_wifi.h"
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/qdev-properties.h"
@@ -188,6 +189,9 @@ static void esp32_soc_reset(DeviceState *dev)
         device_cold_reset(DEVICE(&s->efuse));
         if (s->eth) {
             device_cold_reset(s->eth);
+        }
+        if (s->wifi) {
+            device_cold_reset(s->wifi);
         }
 
         device_cold_reset(DEVICE(&s->rgb));
@@ -775,6 +779,36 @@ static void esp32_machine_init_openeth(Esp32SocState *ss)
     memory_region_add_subregion(sys_mem, desc_base, sysbus_mmio_get_region(sbd, 1));
 }
 
+static void esp32_wifi_map_region(void *opaque, hwaddr base, MemoryRegion *mr)
+{
+    MemoryRegion *sys_mem = opaque;
+    MemoryRegion *mr_apb = g_new(MemoryRegion, 1);
+    g_autofree char *name = g_strdup_printf("%s-apb", memory_region_name(mr));
+
+    /* Below the other peripherals: the RNG lives in the WDEV block */
+    memory_region_add_subregion_overlap(sys_mem, base, mr, -1);
+    memory_region_init_alias(mr_apb, memory_region_owner(mr), name, mr, 0,
+                             memory_region_size(mr));
+    memory_region_add_subregion_overlap(sys_mem,
+                                        base - DR_REG_DPORT_APB_BASE + APB_REG_BASE,
+                                        mr_apb, -1);
+}
+
+static void esp32_machine_init_wifi(Esp32SocState *ss)
+{
+    DeviceState *dev = qemu_create_nic_device(TYPE_ESP32_WIFI, false, NULL);
+
+    if (!dev) {
+        return;
+    }
+    ss->wifi = dev;
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp_wifi_map(ESP_WIFI(dev), esp32_wifi_map_region, get_system_memory());
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in(DEVICE(&ss->intmatrix),
+                                        ETS_WIFI_MAC_INTR_SOURCE));
+}
+
 static void esp32_machine_init_sd(Esp32SocState *ss)
 {
     DriveInfo *dinfo = drive_get(IF_SD, 0, 0);
@@ -829,6 +863,7 @@ static void esp32_machine_init(MachineState *machine)
     esp32_machine_init_i2c(ss);
 
     esp32_machine_init_openeth(ss);
+    esp32_machine_init_wifi(ss);
 
     esp32_machine_init_sd(ss);
 

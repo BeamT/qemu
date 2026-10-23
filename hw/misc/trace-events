@@ -368,3 +368,23 @@ aspeed_sli_read(uint64_t offset, unsigned int size, uint32_t data) "To 0x%" PRIx
 aspeed_sliio_write(uint64_t offset, unsigned int size, uint32_t data) "To 0x%" PRIx64 " of size %u: 0x%" PRIx32
 aspeed_sliio_read(uint64_t offset, unsigned int size, uint32_t data) "To 0x%" PRIx64 " of size %u: 0x%" PRIx32
 
+
+# esp_wifi.c
+esp_wifi_mac_read(uint64_t addr, uint32_t value) "0x%03" PRIx64 " -> 0x%08" PRIx32
+esp_wifi_mac_write(uint64_t addr, uint64_t value) "0x%03" PRIx64 " <- 0x%08" PRIx64
+esp_wifi_radio_read(const char *block, uint64_t addr, uint64_t value) "%s 0x%03" PRIx64 " -> 0x%08" PRIx64
+esp_wifi_radio_write(const char *block, uint64_t addr, uint64_t value) "%s 0x%03" PRIx64 " <- 0x%08" PRIx64
+esp_wifi_channel(uint32_t old, uint32_t new) "channel %" PRIu32 " -> %" PRIu32
+esp_wifi_tx(int slot, size_t len, uint32_t plcp_len, uint16_t fc) "slot %d len %zu plcp len %" PRIu32 " fc 0x%04x"
+esp_wifi_tx_done(int slot, bool acked) "slot %d acked %d"
+esp_wifi_rx(uint32_t desc, uint32_t len, uint16_t fc) "descriptor 0x%08" PRIx32 " len %" PRIu32 " fc 0x%04x"
+esp_wifi_rx_stall(uint32_t desc, uint32_t word0) "descriptor 0x%08" PRIx32 " not available (0x%08" PRIx32 ")"
+esp_wifi_rx_drop(size_t len, uint32_t size) "frame of %zu bytes dropped, buffer %" PRIu32
+
+# esp_wifi_air.c
+esp_wifi_link(const char *ssid, int state) "%s: link state %d"
+esp_wifi_eapol(const char *role, int msg) "%s: EAPOL-Key message %d"
+esp_wifi_guest_ap(const char *ssid, uint32_t channel, bool rsn) "guest SoftAP %s channel %" PRIu32 " rsn %d"
+esp_wifi_client_new(uint8_t a0, uint8_t a1, uint8_t a2, uint8_t a3, uint8_t a4, uint8_t a5) "emulating station %02x:%02x:%02x:%02x:%02x:%02x"
+esp_wifi_air_tx(uint32_t channel, size_t len, uint16_t fc) "channel %" PRIu32 " len %zu fc 0x%04x"
+esp_wifi_air_rx(uint8_t channel, size_t len, uint16_t fc) "channel %u len %zu fc 0x%04x"
