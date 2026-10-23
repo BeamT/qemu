@@ -7,7 +7,7 @@
  * confidence levels are listed in docs/wifi.md.
  *
  * Copyright (c) 2022 Martin Johnson
- * Copyright (c) 2023 Jasper Devreker (redfast00)
+ * Copyright (c) 2023 redfast00
  * Copyright (c) 2023 lcgamboa
  * Copyright (c) 2026 Jason Kraus
  *

@@ -55,7 +55,6 @@
 #define AIR_RSSI                (-40)
 
 /* EAPOL-Key information bits */
-#define KEY_INFO_VERSION_AES    0x0002
 #define KEY_INFO_PAIRWISE       0x0008
 #define KEY_INFO_INSTALL        0x0040
 #define KEY_INFO_ACK            0x0080
@@ -181,55 +180,132 @@ static bool wpa_pmk(const char *psk, const char *ssid, uint8_t *pmk)
     return true;
 }
 
-static bool hmac_sha1(const uint8_t *key, size_t nkey, const uint8_t *data,
-                      size_t len, uint8_t *out)
+static void hmac(QCryptoHashAlgo alg, const uint8_t *key, size_t nkey,
+                 const uint8_t *data, size_t len, uint8_t *out)
 {
     g_autoptr(QCryptoHmac) h = NULL;
     g_autofree uint8_t *res = NULL;
     size_t nres = 0;
 
-    h = qcrypto_hmac_new(QCRYPTO_HASH_ALGO_SHA1, key, nkey, &error_abort);
-    if (qcrypto_hmac_bytes(h, (const char *)data, len, &res, &nres,
-                           &error_abort) < 0) {
-        return false;
-    }
-    memcpy(out, res, 20);
-    return true;
+    h = qcrypto_hmac_new(alg, key, nkey, &error_abort);
+    qcrypto_hmac_bytes(h, (const char *)data, len, &res, &nres, &error_abort);
+    memcpy(out, res, nres);
 }
 
+static void aes_ecb(const uint8_t *key, const uint8_t *in, uint8_t *out)
+{
+    g_autoptr(QCryptoCipher) c = NULL;
+
+    c = qcrypto_cipher_new(QCRYPTO_CIPHER_ALGO_AES_128,
+                           QCRYPTO_CIPHER_MODE_ECB, key, 16, &error_abort);
+    qcrypto_cipher_encrypt(c, in, out, 16, &error_abort);
+}
+
+static void cmac_subkey(uint8_t *k)
+{
+    uint8_t msb = k[0] & 0x80;
+    int i;
+
+    for (i = 0; i < 15; i++) {
+        k[i] = (k[i] << 1) | (k[i + 1] >> 7);
+    }
+    k[15] = (k[15] << 1) ^ (msb ? 0x87 : 0);
+}
+
+/* AES-128-CMAC (RFC 4493) */
+static void aes_cmac(const uint8_t *key, const uint8_t *msg, size_t len,
+                     uint8_t *mac)
+{
+    uint8_t k[16] = {}, x[16] = {}, last[16] = {};
+    size_t n = len ? (len + 15) / 16 : 1;
+    size_t i, j;
+
+    aes_ecb(key, k, k);
+    cmac_subkey(k);                     /* K1 */
+    if (len == 0 || len % 16) {
+        size_t rem = len - (n - 1) * 16;
+
+        memcpy(last, msg + (n - 1) * 16, rem);
+        last[rem] = 0x80;
+        cmac_subkey(k);                 /* K2 */
+    } else {
+        memcpy(last, msg + (n - 1) * 16, 16);
+    }
+    for (i = 0; i < n; i++) {
+        const uint8_t *m = i == n - 1 ? last : msg + i * 16;
+
+        for (j = 0; j < 16; j++) {
+            x[j] ^= m[j] ^ (i == n - 1 ? k[j] : 0);
+        }
+        aes_ecb(key, x, x);
+    }
+    memcpy(mac, x, 16);
+}
+
+/*
+ * Derive the PTK: PRF-384 with HMAC-SHA1 for AKM 00-0f-ac:2 (PSK), KDF-384
+ * with HMAC-SHA256 for AKM 00-0f-ac:6 (PSK-SHA256, used with PMF).
+ */
 static void wpa_ptk(EspWifiRsnKeys *k, const uint8_t *pmk,
                     const uint8_t *aa, const uint8_t *spa)
 {
     static const char label[] = "Pairwise key expansion";
-    uint8_t data[sizeof(label) + 6 + 6 + 32 + 32 + 1];
-    uint8_t out[60];
-    uint8_t *p = data;
+    uint8_t data[2 + sizeof(label) + 6 + 6 + 32 + 32 + 2];
+    uint8_t out[64];
     bool a_first = memcmp(aa, spa, 6) < 0;
     bool an_first = memcmp(k->anonce, k->snonce, 32) < 0;
+    uint8_t *ctx = data + 2 + sizeof(label) - 1;
+    uint8_t *p = ctx;
     int i;
 
-    memcpy(p, label, sizeof(label));    /* including the NUL */
-    p += sizeof(label);
+    memcpy(data + 2, label, sizeof(label) - 1);
     memcpy(p, a_first ? aa : spa, 6);
     memcpy(p + 6, a_first ? spa : aa, 6);
     p += 12;
     memcpy(p, an_first ? k->anonce : k->snonce, 32);
     memcpy(p + 32, an_first ? k->snonce : k->anonce, 32);
     p += 64;
-    for (i = 0; i < 3; i++) {
-        *p = i;
-        hmac_sha1(pmk, 32, data, sizeof(data), out + i * 20);
+
+    if (k->akm == 6) {
+        /* i || label || context || length, all counters little endian */
+        stw_le_p(p, 384);
+        for (i = 0; i < 2; i++) {
+            stw_le_p(data, i + 1);
+            hmac(QCRYPTO_HASH_ALGO_SHA256, pmk, 32, data, p + 2 - data,
+                 out + i * 32);
+        }
+    } else {
+        /* label || 0 || context || i */
+        uint8_t *prf = data + 2;
+
+        prf[sizeof(label) - 1] = 0;
+        memmove(prf + sizeof(label), ctx, 76);
+        for (i = 0; i < 3; i++) {
+            prf[sizeof(label) + 76] = i;
+            hmac(QCRYPTO_HASH_ALGO_SHA1, pmk, 32, prf, sizeof(label) + 77,
+                 out + i * 20);
+        }
     }
     memcpy(k->ptk, out, sizeof(k->ptk));
     k->ptk_valid = true;
 }
 
+/* Key descriptor version: 2 is HMAC-SHA1 and AES key wrap, 3 is AES-CMAC */
+static uint16_t key_version(const EspWifiRsnKeys *k)
+{
+    return k->akm == 6 ? 3 : 2;
+}
+
 static void eapol_mic(const EspWifiRsnKeys *k, uint8_t *eapol, size_t len)
 {
-    uint8_t mic[20];
+    uint8_t mic[32];
 
     memset(eapol + EK_MIC, 0, 16);
-    hmac_sha1(k->ptk, 16, eapol, len, mic);
+    if (k->akm == 6) {
+        aes_cmac(k->ptk, eapol, len, mic);
+    } else {
+        hmac(QCRYPTO_HASH_ALGO_SHA1, k->ptk, 16, eapol, len, mic);
+    }
     memcpy(eapol + EK_MIC, mic, 16);
 }
 
@@ -248,13 +324,10 @@ static bool eapol_mic_ok(const EspWifiRsnKeys *k, const uint8_t *eapol,
 static size_t aes_wrap(const uint8_t *kek, const uint8_t *in, size_t n,
                        uint8_t *out)
 {
-    g_autoptr(QCryptoCipher) c = NULL;
     size_t blocks = n / 8;
     uint8_t a[8], b[16];
     int i, j;
 
-    c = qcrypto_cipher_new(QCRYPTO_CIPHER_ALGO_AES_128,
-                           QCRYPTO_CIPHER_MODE_ECB, kek, 16, &error_abort);
     memset(a, 0xa6, 8);
     memcpy(out + 8, in, n);
     for (j = 0; j < 6; j++) {
@@ -263,7 +336,7 @@ static size_t aes_wrap(const uint8_t *kek, const uint8_t *in, size_t n,
 
             memcpy(b, a, 8);
             memcpy(b + 8, out + i * 8, 8);
-            qcrypto_cipher_encrypt(c, b, b, 16, &error_abort);
+            aes_ecb(kek, b, b);
             memcpy(a, b, 8);
             a[7] ^= t & 0xff;
             a[6] ^= (t >> 8) & 0xff;
@@ -397,7 +470,7 @@ static void ap_send_eapol(EspWifiState *s, EspWifiAp *ap, int msg)
     if (msg == 1) {
         qemu_guest_getrandom_nofail(k->anonce, sizeof(k->anonce));
         k->ptk_valid = false;
-        info = KEY_INFO_VERSION_AES | KEY_INFO_PAIRWISE | KEY_INFO_ACK;
+        info = key_version(k) | KEY_INFO_PAIRWISE | KEY_INFO_ACK;
         wb_eapol_key(&b, info, ++k->replay, k->anonce, NULL, 0, &eapol_len);
     } else {
         /* RSN IE and GTK KDE, padded and wrapped with the KEK */
@@ -418,7 +491,7 @@ static void ap_send_eapol(EspWifiState *s, EspWifiAp *ap, int msg)
             kd[nkd++] = 0;
         }
         nkd = aes_wrap(k->ptk + 16, kd, nkd, wrapped);
-        info = KEY_INFO_VERSION_AES | KEY_INFO_PAIRWISE | KEY_INFO_INSTALL |
+        info = key_version(k) | KEY_INFO_PAIRWISE | KEY_INFO_INSTALL |
                KEY_INFO_ACK | KEY_INFO_MIC | KEY_INFO_SECURE |
                KEY_INFO_ENCRYPTED;
         eapol = wb_eapol_key(&b, info, ++k->replay, k->anonce, wrapped, nkd,
@@ -495,6 +568,7 @@ static void ap_rx_mgmt(EspWifiState *s, EspWifiAp *ap, unsigned subtype,
         if (ap_rsn(ap)) {
             ap->link = ESP_WIFI_LINK_HANDSHAKE;
             ap->keys.replay = 0;
+            ap->keys.akm = 2;
             ap_send_eapol(s, ap, 1);
         } else {
             ap->link = ESP_WIFI_LINK_ESTABLISHED;
@@ -645,6 +719,15 @@ static EspWifiClient *client_new(EspWifiState *s, const uint8_t *mac)
     return NULL;
 }
 
+/* RSN IE of the emulated clients, matching what the guest SoftAP offers */
+static size_t client_rsn_ie(EspWifiState *s, uint8_t *ie)
+{
+    memcpy(ie, rsn_ie, sizeof(rsn_ie));
+    ie[19] = s->guest_ap.akm;
+    stw_le_p(ie + 20, s->guest_ap.rsn_caps);
+    return sizeof(rsn_ie);
+}
+
 static void client_send_mgmt(EspWifiState *s, EspWifiClient *c,
                              unsigned subtype, const void *body, size_t n)
 {
@@ -660,7 +743,9 @@ static void client_send_mgmt(EspWifiState *s, EspWifiClient *c,
         wb_rates(&b);
         wb_ie(&b, WLAN_EID_DS_PARAMS, &ch, 1);
         if (g->rsn) {
-            wb_put(&b, rsn_ie, sizeof(rsn_ie));
+            uint8_t ie[sizeof(rsn_ie)];
+
+            wb_put(&b, ie, client_rsn_ie(s, ie));
         }
     }
     esp_wifi_deliver(s, b.d, b.len, AIR_RSSI);
@@ -703,7 +788,8 @@ static void client_kick(EspWifiState *s, EspWifiClient *c)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint8_t auth[6];
 
-    if (!s->guest_ap.valid || c->link != ESP_WIFI_LINK_NONE ||
+    if (!s->guest_ap.valid || (s->guest_ap.rsn && !s->guest_ap.akm) ||
+        c->link != ESP_WIFI_LINK_NONE ||
         (c->last_attempt && now - c->last_attempt < CLIENT_RETRY_NS)) {
         return;
     }
@@ -764,6 +850,7 @@ static void client_rx_eapol(EspWifiState *s, EspWifiClient *c,
 {
     EspWifiGuestAp *g = &s->guest_ap;
     EspWifiRsnKeys *k = &c->keys;
+    uint8_t ie[sizeof(rsn_ie)];
     uint16_t info, reply;
     size_t eapol_len;
     uint8_t *out;
@@ -784,10 +871,11 @@ static void client_rx_eapol(EspWifiState *s, EspWifiClient *c,
         trace_esp_wifi_eapol("client", 1);
         memcpy(k->anonce, eapol + EK_NONCE, 32);
         qemu_guest_getrandom_nofail(k->snonce, 32);
+        k->akm = g->akm;
         wpa_ptk(k, g->pmk, g->bssid.a, c->mac.a);
-        reply = KEY_INFO_VERSION_AES | KEY_INFO_PAIRWISE | KEY_INFO_MIC;
-        out = wb_eapol_key(&b, reply, k->replay, k->snonce, rsn_ie,
-                           sizeof(rsn_ie), &eapol_len);
+        reply = key_version(k) | KEY_INFO_PAIRWISE | KEY_INFO_MIC;
+        out = wb_eapol_key(&b, reply, k->replay, k->snonce, ie,
+                           client_rsn_ie(s, ie), &eapol_len);
     } else {
         /* Message 3: answer with message 4 */
         trace_esp_wifi_eapol("client", 3);
@@ -796,7 +884,7 @@ static void client_rx_eapol(EspWifiState *s, EspWifiClient *c,
                           "MIC mismatch, check client-psk\n");
             return;
         }
-        reply = KEY_INFO_VERSION_AES | KEY_INFO_PAIRWISE | KEY_INFO_MIC |
+        reply = key_version(k) | KEY_INFO_PAIRWISE | KEY_INFO_MIC |
                 KEY_INFO_SECURE;
         out = wb_eapol_key(&b, reply, k->replay, NULL, NULL, 0, &eapol_len);
     }
@@ -807,6 +895,38 @@ static void client_rx_eapol(EspWifiState *s, EspWifiClient *c,
     }
 }
 
+/*
+ * Pick the AKM suite the emulated clients use with the guest SoftAP: PSK, or
+ * PSK-SHA256 when the SoftAP requires protected management frames. Returns 0
+ * if neither is offered (e.g. WPA3-SAE only).
+ */
+static uint8_t rsn_parse(const uint8_t *ie, uint16_t *caps)
+{
+    const uint8_t *p = ie + 2, *end = ie + 2 + ie[1];
+    uint8_t akm = 0;
+    uint16_t n, i;
+
+    p += 2 + 4;                         /* version, group cipher */
+    if (p + 2 > end) {
+        return 0;
+    }
+    n = lduw_le_p(p);
+    p += 2 + 4 * n;                     /* pairwise ciphers */
+    if (p + 2 > end) {
+        return 0;
+    }
+    n = lduw_le_p(p);
+    p += 2;
+    for (i = 0; i < n && p + 4 <= end; i++, p += 4) {
+        if (!memcmp(p, "\x00\x0f\xac", 3) && (p[3] == 2 || p[3] == 6) &&
+            (!akm || p[3] == 2)) {
+            akm = p[3];
+        }
+    }
+    *caps = p + 2 <= end ? lduw_le_p(p) & 0x00c0 : 0;  /* MFPR, MFPC */
+    return akm;
+}
+
 static void guest_ap_beacon(EspWifiState *s, const uint8_t *f, size_t len)
 {
     EspWifiGuestAp *g = &s->guest_ap;
@@ -814,7 +934,8 @@ static void guest_ap_beacon(EspWifiState *s, const uint8_t *f, size_t len)
     size_t nies = len > WLAN_HDR_LEN + 12 ? len - WLAN_HDR_LEN - 12 : 0;
     const uint8_t *ssid = wlan_find_ie(ies, nies, WLAN_EID_SSID);
     const uint8_t *ds = wlan_find_ie(ies, nies, WLAN_EID_DS_PARAMS);
-    bool rsn = wlan_find_ie(ies, nies, WLAN_EID_RSN) != NULL;
+    const uint8_t *rsn_ie_p = wlan_find_ie(ies, nies, WLAN_EID_RSN);
+    bool rsn = rsn_ie_p != NULL;
     char name[33] = "";
 
     if (ssid && ssid[1] <= 32) {
@@ -828,9 +949,14 @@ static void guest_ap_beacon(EspWifiState *s, const uint8_t *f, size_t len)
     pstrcpy(g->ssid, sizeof(g->ssid), name);
     g->channel = ds && ds[1] ? ds[2] : s->channel;
     g->rsn = rsn;
+    g->akm = rsn ? rsn_parse(rsn_ie_p, &g->rsn_caps) : 0;
     g->valid = true;
-    trace_esp_wifi_guest_ap(g->ssid, g->channel, rsn);
-    if (rsn) {
+    trace_esp_wifi_guest_ap(g->ssid, g->channel, rsn, g->akm, g->rsn_caps);
+    if (rsn && !g->akm) {
+        qemu_log_mask(LOG_UNIMP, "esp_wifi: SoftAP '%s' offers neither WPA2-PSK "
+                      "nor PSK-SHA256, its clients cannot be emulated\n",
+                      g->ssid);
+    } else if (rsn) {
         if (!s->client_psk || !wpa_pmk(s->client_psk, g->ssid, g->pmk)) {
             qemu_log_mask(LOG_GUEST_ERROR, "esp_wifi: SoftAP '%s' uses WPA2, "
                           "set the client-psk property to join it\n", g->ssid);

@@ -8,11 +8,11 @@
  * the wireless medium.
  *
  * Based on the ESP32 Wi-Fi emulation by Martin Johnson, its port to the
- * espressif/qemu tree by Jasper Devreker (redfast00) and the ESP32-C3 port by
+ * espressif/qemu tree by redfast00 and the ESP32-C3 port by
  * lcgamboa. See docs/wifi-provenance.md.
  *
  * Copyright (c) 2022 Martin Johnson
- * Copyright (c) 2023 Jasper Devreker (redfast00)
+ * Copyright (c) 2023 redfast00
  * Copyright (c) 2023 lcgamboa
  * Copyright (c) 2026 Jason Kraus
  *

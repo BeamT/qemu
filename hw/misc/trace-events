@@ -384,7 +384,7 @@ esp_wifi_rx_drop(size_t len, uint32_t size) "frame of %zu bytes dropped, buffer 
 # esp_wifi_air.c
 esp_wifi_link(const char *ssid, int state) "%s: link state %d"
 esp_wifi_eapol(const char *role, int msg) "%s: EAPOL-Key message %d"
-esp_wifi_guest_ap(const char *ssid, uint32_t channel, bool rsn) "guest SoftAP %s channel %" PRIu32 " rsn %d"
+esp_wifi_guest_ap(const char *ssid, uint32_t channel, bool rsn, uint8_t akm, uint16_t caps) "guest SoftAP %s channel %" PRIu32 " rsn %d akm %u caps 0x%04x"
 esp_wifi_client_new(uint8_t a0, uint8_t a1, uint8_t a2, uint8_t a3, uint8_t a4, uint8_t a5) "emulating station %02x:%02x:%02x:%02x:%02x:%02x"
 esp_wifi_air_tx(uint32_t channel, size_t len, uint16_t fc) "channel %" PRIu32 " len %zu fc 0x%04x"
 esp_wifi_air_rx(uint8_t channel, size_t len, uint16_t fc) "channel %u len %zu fc 0x%04x"

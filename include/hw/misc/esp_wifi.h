@@ -7,7 +7,7 @@
  * docs/wifi.md for the register map and the confidence level of each entry.
  *
  * Copyright (c) 2022 Martin Johnson
- * Copyright (c) 2023 Jasper Devreker (redfast00)
+ * Copyright (c) 2023 redfast00
  * Copyright (c) 2023 lcgamboa
  * Copyright (c) 2026 Jason Kraus
  *
@@ -120,6 +120,7 @@ typedef struct EspWifiRsnKeys {
     uint8_t ptk[48];            /* KCK | KEK | TK */
     uint64_t replay;
     uint64_t tx_pn;
+    uint8_t akm;                /* 00-0f-ac suite: 2 PSK, 6 PSK-SHA256 */
     bool ptk_valid;
 } EspWifiRsnKeys;
 
@@ -157,6 +158,8 @@ typedef struct EspWifiGuestAp {
     char ssid[33];
     uint32_t channel;
     bool rsn;
+    uint8_t akm;                /* AKM the emulated clients use */
+    uint16_t rsn_caps;          /* PMF bits the emulated clients announce */
     uint8_t pmk[32];
 } EspWifiGuestAp;
 

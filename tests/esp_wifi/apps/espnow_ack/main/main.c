@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include <string.h>
+#include <sys/param.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "esp_event.h"
@@ -25,7 +26,7 @@
 #else
 #define ENCRYPT false
 #endif
-#define MAX_TRIES 200
+#define MAX_TRIES 300
 
 static QueueHandle_t s_status;
 static volatile int s_rx;
@@ -98,24 +99,30 @@ void app_main(void)
     printf("ESPNOW_TEST own " MACSTR " peer " MACSTR "\n", MAC2STR(own),
            MAC2STR(peer));
 
-    /* The peer may still be booting: retry until it acknowledges */
-    for (tries = 0; tries < MAX_TRIES && ok < COUNT; tries++) {
+    /*
+     * The peer's MAC acknowledges frames as soon as its radio is up, which
+     * can be before its application listens. Keep sending until both sides
+     * have heard each other, then for a while longer for the peer's sake.
+     */
+    for (tries = 0; tries < MAX_TRIES && (ok < COUNT || s_rx < COUNT);
+         tries++) {
         if (send_one(peer) == ESP_NOW_SEND_SUCCESS) {
             ok++;
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(100));
         }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    for (tries = 0; tries < 30; tries++) {
+        send_one(peer);
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
     for (tries = 0; tries < COUNT; tries++) {
         if (send_one(missing) == ESP_NOW_SEND_FAIL) {
             fail++;
         }
     }
-    /* Give the peer time to finish its own sends */
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    printf("ESPNOW_TEST peer_ok=%d/%d missing_fail=%d/%d rx=%d\n", ok, COUNT,
-           fail, COUNT, s_rx);
-    printf("ESPNOW_TEST %s\n", ok == COUNT && fail == COUNT && s_rx >= COUNT ?
+    printf("ESPNOW_TEST peer_ok=%d/%d missing_fail=%d/%d rx=%d\n",
+           MIN(ok, COUNT), COUNT, fail, COUNT, s_rx);
+    printf("ESPNOW_TEST %s\n", ok >= COUNT && fail == COUNT && s_rx >= COUNT ?
            "PASS" : "FAIL");
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
