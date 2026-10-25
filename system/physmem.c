@@ -587,6 +587,11 @@ typedef struct TCGIOMMUNotifier {
     bool active;
 } TCGIOMMUNotifier;
 
+static void tcg_iommu_flush_tlb(CPUState *cpu, run_on_cpu_data data)
+{
+    tlb_flush(cpu);
+}
+
 static void tcg_iommu_unmap_notify(IOMMUNotifier *n, IOMMUTLBEntry *iotlb)
 {
     TCGIOMMUNotifier *notifier = container_of(n, TCGIOMMUNotifier, n);
@@ -594,7 +599,17 @@ static void tcg_iommu_unmap_notify(IOMMUNotifier *n, IOMMUTLBEntry *iotlb)
     if (!notifier->active) {
         return;
     }
-    tlb_flush(notifier->cpu);
+    /*
+     * Every CPU that used the IOMMU has a notifier, but the unmap comes from
+     * whichever CPU wrote the IOMMU. tlb_flush() must run on the CPU that
+     * owns the TLB: with MTTCG, flushing another CPU's TLB from this thread
+     * frees it while that CPU is using it.
+     */
+    if (qemu_cpu_is_self(notifier->cpu)) {
+        tlb_flush(notifier->cpu);
+    } else {
+        async_run_on_cpu(notifier->cpu, tcg_iommu_flush_tlb, RUN_ON_CPU_NULL);
+    }
     notifier->active = false;
     /* We leave the notifier struct on the list to avoid reallocating it later.
      * Generally the number of IOMMUs a CPU deals with will be small.
