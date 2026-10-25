@@ -147,6 +147,12 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
   'esp32_flash_enc.c',
   'ssi_psram.c'
 ))
+system_ss.add(when: 'CONFIG_ESP_WIFI', if_true: files(
+  'esp_wifi.c',
+  'esp_wifi_air.c',
+  'esp32_wifi.c',
+  'esp32c3_wifi.c',
+))
 
 system_ss.add(when: 'CONFIG_RISCV_ESP32C3', if_true: files(
   'esp32c3_cache.c',
