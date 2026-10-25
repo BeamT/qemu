@@ -182,6 +182,7 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files(
   'esp32s3_cache.c',
   'cam_jpeg.c',
   'dvp_sensor.c',
+  'esp32s3_lcd_cam.c',
   'ov5640.c',
   'ssi_psram.c',
   'esp_sha.c',

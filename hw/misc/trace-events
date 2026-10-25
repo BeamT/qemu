@@ -392,3 +392,7 @@ esp_wifi_air_rx(uint8_t channel, size_t len, uint16_t fc) "channel %u len %zu fc
 # ov5640.c
 ov5640_write(uint16_t reg, uint8_t value) "reg 0x%04x = 0x%02x"
 ov5640_frame(unsigned width, unsigned height, int quality, unsigned len) "%ux%u at quality %d: %u bytes"
+
+# esp32s3_lcd_cam.c
+esp32s3_lcd_cam_frame_start(unsigned len) "receiving a %u-byte frame"
+esp32s3_lcd_cam_frame_end(unsigned received, bool ok) "frame ended after %u bytes, complete: %d"
