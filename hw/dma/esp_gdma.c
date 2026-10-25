@@ -530,6 +530,98 @@ bool esp_gdma_write_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uin
 
 
 /**
+ * Check the header file for more info about this function
+ */
+bool esp_gdma_get_in_channel(ESPGdmaState *s, GdmaPeripheral periph, uint32_t* chan)
+{
+    const ESPGdmaClass* class = ESP_GDMA_GET_CLASS(s);
+
+    for (int i = 0; i < class->m_channel_count; i++) {
+        if (FIELD_EX32(s->ch_conf[ESP_GDMA_IN_IDX][i].peripheral, GDMA_PERI_SEL, PERI_SEL) == periph) {
+            *chan = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+
+/**
+ * @brief Start feeding the IN link of a channel from its peripheral, at the descriptor in DMA_IN_LINK
+ */
+static void esp_gdma_stream_start(ESPGdmaState *s, uint32_t chan)
+{
+    DmaConfigState* state = &s->ch_conf[ESP_GDMA_IN_IDX][chan];
+
+    state->stream_desc = ((ESP_GDMA_RAM_ADDR >> 20) << 20) | FIELD_EX32(state->link, GDMA_IN_LINK, ADDR);
+    state->stream_len = 0;
+    state->stream_running = true;
+    esp_gdma_push_descriptor(s, chan, ESP_GDMA_IN_IDX, state->stream_desc);
+}
+
+
+/**
+ * Check the header file for more info about this function
+ */
+bool esp_gdma_push_in(ESPGdmaState *s, uint32_t chan, const uint8_t* data, uint32_t size, bool eof)
+{
+    DmaConfigState* state = &s->ch_conf[ESP_GDMA_IN_IDX][chan];
+    const bool owner_check = FIELD_EX32(state->conf1, GDMA_IN_CONF1, CHECK_OWNER);
+    GdmaLinkedList node;
+
+    while (state->stream_running) {
+        if (!esp_gdma_read_descr(s, state->stream_desc, &node) || (owner_check && !node.config.owner)) {
+            esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_IN_DSCR_ERR_MASK);
+            state->stream_running = false;
+            return false;
+        }
+
+        const uint32_t count = MIN(size, node.config.size - state->stream_len);
+        if (count && !esp_gdma_write_guest(s, node.buf_addr + state->stream_len, (void*) data, count)) {
+            esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_IN_DSCR_ERR_MASK);
+            state->stream_running = false;
+            return false;
+        }
+        data += count;
+        size -= count;
+        state->stream_len += count;
+
+        const bool last = eof && size == 0;
+        if (state->stream_len < node.config.size && !last) {
+            /* All the data fits in the current descriptor, which stays open */
+            return true;
+        }
+
+        /* Close the descriptor and move to the next one */
+        node.config.length = state->stream_len;
+        node.config.owner = 0;
+        node.config.suc_eof = last;
+        esp_gdma_write_descr(s, state->stream_desc, &node);
+        if (last) {
+            state->suc_eof_desc_addr = state->stream_desc;
+            esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_IN_DONE_MASK |
+                                                   R_GDMA_INTERRUPT_IN_SUC_EOF_MASK);
+        } else {
+            esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_IN_DONE_MASK);
+        }
+
+        state->stream_desc = node.next_addr;
+        state->stream_len = 0;
+        esp_gdma_push_descriptor(s, chan, ESP_GDMA_IN_IDX, node.next_addr);
+        if (node.next_addr == 0) {
+            esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_IN_DSCR_EMPTY_MASK);
+            state->stream_running = false;
+            return size == 0;
+        }
+        if (size == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+
+/**
  * @brief Check if a memory-to-memory transfer can be started and start it if possible
  *
  * @param s GDMA state structure
@@ -791,6 +883,7 @@ static void esp_gdma_write_chan_conf(ESPGdmaState *state, uint32_t dir, uint32_t
                 FIELD_EX32(s->conf0, GDMA_IN_CONF0, RST) != 0)
             {
                 esp_gdma_reset_fifo(s);
+                s->stream_running = false;
             }
             /* Update the register before going further */
             s->conf0 = value;
@@ -812,6 +905,17 @@ static void esp_gdma_write_chan_conf(ESPGdmaState *state, uint32_t dir, uint32_t
             if ((value & start_mask) || (value & restart_mask))
             {
                 esp_gdma_check_and_start_mem_transfer(state, chan);
+            }
+            /* A peripheral-to-memory IN link runs from START until STOP or a reset. STOP clears
+             * itself, as on the hardware, so that a later read-modify-write setting START does
+             * not stop the link again. */
+            if (dir == ESP_GDMA_IN_IDX && !FIELD_EX32(s->conf0, GDMA_IN_CONF0, MEM_TRANS_EN)) {
+                if (value & R_GDMA_IN_LINK_STOP_MASK) {
+                    s->stream_running = false;
+                    s->link &= ~R_GDMA_IN_LINK_STOP_MASK;
+                } else if (value & start_mask) {
+                    esp_gdma_stream_start(state, chan);
+                }
             }
             break;
 

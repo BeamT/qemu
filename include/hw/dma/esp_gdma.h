@@ -109,6 +109,11 @@ typedef struct {
     uint32_t peripheral;
     /* Interrupt related registers */
     DmaIntState int_state;
+    /* IN channels fed by a peripheral (see esp_gdma_push_in): whether the link is running,
+     * the guest address of the descriptor being filled, and the bytes already in it */
+    bool stream_running;
+    uint32_t stream_desc;
+    uint32_t stream_len;
 } DmaConfigState;
 
 
@@ -157,6 +162,26 @@ bool esp_gdma_get_channel_periph(ESPGdmaState *s, GdmaPeripheral periph, int dir
 
 bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint32_t size);
 bool esp_gdma_write_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint32_t size);
+
+
+/**
+ * @brief Get the IN channel whose PERI_SEL selects the given peripheral
+ *
+ * @returns true and the channel in `chan` if there is one, false else
+ */
+bool esp_gdma_get_in_channel(ESPGdmaState *s, GdmaPeripheral periph, uint32_t* chan);
+
+/**
+ * @brief Push data from a peripheral into the IN link of a channel, as a peripheral does through
+ *        the GDMA FIFO: unlike `esp_gdma_write_channel`, each call continues where the previous one
+ *        stopped, until the link is stopped or reset. The link must have been started with
+ *        INLINK_START. A descriptor is closed (written back, IN_DONE raised) when it is full, or
+ *        after the data if `eof` is set, in which case its suc_eof bit is set and IN_SUC_EOF raised.
+ *
+ * @returns true if all the data was written, false if the link is not running or ran out of
+ *          descriptors
+ */
+bool esp_gdma_push_in(ESPGdmaState *s, uint32_t chan, const uint8_t* data, uint32_t size, bool eof);
 
 
 /**

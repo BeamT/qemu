@@ -54,6 +54,8 @@
 #include "hw/nvram/esp32s3_efuse.h"
 #include "hw/xtensa/esp32s3_clk.h"
 #include "hw/dma/esp32s3_gdma.h"
+#include "hw/i2c/esp32s3_i2c.h"
+#include "hw/misc/esp32s3_lcd_cam.h"
 #include "hw/misc/esp32s3_sha.h"
 #include "hw/misc/esp32s3_aes.h"
 #include "hw/misc/esp32s3_rsa.h"
@@ -138,6 +140,8 @@ typedef struct Esp32s3SocState {
     ESP32S3EfuseState efuse;
     ESP32S3ClockState clock;
     ESP32S3GdmaState gdma;
+    ESP32S3I2CState i2c[ESP32S3_I2C_COUNT];
+    ESP32S3LcdCamState lcd_cam;
     ESP32S3ShaState sha;
     ESP32S3AesState aes;
     ESP32S3RsaState rsa;
@@ -173,14 +177,8 @@ typedef struct Esp32s3SocState {
 #define A_SYSCON_WIFI_RST_EN    0x018
 #define SYSCON_WIFIMAC_RST      BIT(2)
 
-/* SYSTEM_PERIP_RST_EN0 and _EN1, and the UART reset bit of each UART */
+/* SYSTEM_PERIP_RST_EN0 and _EN1 */
 #define A_SYSTEM_PERIP_RST_EN   0x020
-static const struct {
-    int reg;
-    uint32_t bit;
-} uart_rst[ESP32S3_UART_COUNT] = {
-    { 0, BIT(2) }, { 0, BIT(5) }, { 1, BIT(9) },
-};
 
 /* "QEMU" as a 32-bit value, can be used by the application to to check whether it is running in
  * QEMU or on real hardware */
@@ -272,10 +270,23 @@ static void esp32s3_perip_rst_en_write(void *opaque, hwaddr addr,
     Esp32s3SocState *s = opaque;
     int reg = addr / 4;
     uint32_t rising = value & ~s->perip_rst_en[reg];
+    /* The emulated peripherals reset through these registers, and their bits */
+    const struct {
+        int reg;
+        uint32_t bit;
+        DeviceState *dev;
+    } rst[] = {
+        { 0, BIT(2), DEVICE(&s->uart[0]) },
+        { 0, BIT(5), DEVICE(&s->uart[1]) },
+        { 1, BIT(9), DEVICE(&s->uart[2]) },
+        { 0, BIT(7), DEVICE(&s->i2c[0]) },
+        { 0, BIT(18), DEVICE(&s->i2c[1]) },
+        { 1, BIT(8), DEVICE(&s->lcd_cam) },
+    };
 
-    for (int i = 0; i < ESP32S3_UART_COUNT; i++) {
-        if (uart_rst[i].reg == reg && (rising & uart_rst[i].bit)) {
-            device_cold_reset(DEVICE(&s->uart[i]));
+    for (int i = 0; i < ARRAY_SIZE(rst); i++) {
+        if (rst[i].reg == reg && (rising & rst[i].bit)) {
+            device_cold_reset(rst[i].dev);
         }
     }
     s->perip_rst_en[reg] = value;
@@ -784,6 +795,10 @@ static void esp32s3_machine_init(MachineState *machine)
     object_initialize_child(OBJECT(ss), "clock", &ss->clock, TYPE_ESP32S3_CLOCK);
 
     object_initialize_child(OBJECT(ss), "gdma", &ss->gdma, TYPE_ESP32S3_GDMA);
+    object_initialize_child(OBJECT(ss), "i2c0", &ss->i2c[0], TYPE_ESP32S3_I2C);
+    object_initialize_child(OBJECT(ss), "i2c1", &ss->i2c[1], TYPE_ESP32S3_I2C);
+    object_initialize_child(OBJECT(ss), "lcd_cam", &ss->lcd_cam,
+                            TYPE_ESP32S3_LCD_CAM);
     object_initialize_child(OBJECT(ss), "sha", &ss->sha, TYPE_ESP32S3_SHA);
     object_initialize_child(OBJECT(ss), "aes", &ss->aes, TYPE_ESP32S3_AES);
     object_initialize_child(OBJECT(ss), "rsa", &ss->rsa, TYPE_ESP32S3_RSA);
@@ -931,7 +946,7 @@ static void esp32s3_machine_init(MachineState *machine)
 
     /* GDMA Realization */
     {
-        object_property_set_link(OBJECT(&ss->gdma), "soc_mr", OBJECT(dram), &error_abort);
+        object_property_set_link(OBJECT(&ss->gdma), "soc_mr", OBJECT(sys_mem), &error_abort);
         sysbus_realize(SYS_BUS_DEVICE(&ss->gdma), &error_fatal);
         MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->gdma), 0);
         memory_region_add_subregion_overlap(sys_mem, DR_REG_GDMA_BASE, mr, 0);
@@ -943,6 +958,36 @@ static void esp32s3_machine_init(MachineState *machine)
                                         qdev_get_gpio_in(intmatrix_dev, ETS_DMA_OUT_CH0_INTR_SOURCE + i));
         }
    }
+
+    /* I2C controllers realization, see the OV5640 for a device on their bus */
+    {
+        static const hwaddr base[ESP32S3_I2C_COUNT] = {
+            DR_REG_I2C_EXT_BASE, DR_REG_I2C1_EXT_BASE,
+        };
+        static const int irq[ESP32S3_I2C_COUNT] = {
+            ETS_I2C_EXT0_INTR_SOURCE, ETS_I2C_EXT1_INTR_SOURCE,
+        };
+
+        for (int i = 0; i < ESP32S3_I2C_COUNT; i++) {
+            qdev_prop_set_uint8(DEVICE(&ss->i2c[i]), "port", i);
+            sysbus_realize(SYS_BUS_DEVICE(&ss->i2c[i]), &error_fatal);
+            SysBusDevice *sbd = SYS_BUS_DEVICE(&ss->i2c[i]);
+            memory_region_add_subregion_overlap(sys_mem, base[i],
+                                                sysbus_mmio_get_region(sbd, 0), 0);
+            sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(intmatrix_dev, irq[i]));
+        }
+    }
+
+    /* LCD_CAM realization: frames of a DVP sensor, received through the GDMA */
+    {
+        object_property_set_link(OBJECT(&ss->lcd_cam), "gdma", OBJECT(&ss->gdma),
+                                 &error_abort);
+        sysbus_realize(SYS_BUS_DEVICE(&ss->lcd_cam), &error_fatal);
+        MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->lcd_cam), 0);
+        memory_region_add_subregion_overlap(sys_mem, DR_REG_LCD_CAM_BASE, mr, 0);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&ss->lcd_cam), 0,
+                           qdev_get_gpio_in(intmatrix_dev, ETS_LCD_CAM_INTR_SOURCE));
+    }
 
     /* SHA realization */
     {
