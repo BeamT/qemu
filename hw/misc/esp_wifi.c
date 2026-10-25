@@ -23,6 +23,7 @@
 #include "qemu/log.h"
 #include "qemu/bitops.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -598,27 +599,147 @@ static void esp_wifi_realize(DeviceState *dev, Error **errp)
 
 static void esp_wifi_init(Object *obj)
 {
-    esp_wifi_air_init(ESP_WIFI(obj));
+    EspWifiState *s = ESP_WIFI(obj);
+    int i;
+
+    for (i = 0; i < ESP_WIFI_MAX_APS; i++) {
+        s->ap[i].channel = 1;
+        s->ap[i].rssi = -40;
+        s->ap[i].uplink = true;
+    }
+    esp_wifi_air_init(s);
+}
+
+static void esp_wifi_finalize(Object *obj)
+{
+    EspWifiState *s = ESP_WIFI(obj);
+    int i;
+
+    for (i = 0; i < ESP_WIFI_MAX_APS; i++) {
+        g_free(s->ap[i].ssid);
+        g_free(s->ap[i].psk);
+    }
+}
+
+/*
+ * The emulated access points are QOM properties rather than qdev ones so
+ * that they can be changed while the guest runs (qom-set), e.g. to take a
+ * network off the air or change its passphrase.
+ */
+enum { AP_SSID, AP_PSK, AP_CHANNEL, AP_RSSI, AP_SILENT, AP_UPLINK };
+
+static const struct {
+    const char *name, *type, *desc;
+} ap_props[] = {
+    [AP_SSID] = { "ssid", "str", "SSID of the access point, empty: none" },
+    [AP_PSK] = { "psk", "str", "WPA2 passphrase, empty: open network" },
+    [AP_CHANNEL] = { "channel", "uint32", "Channel, 1 to 14" },
+    [AP_RSSI] = { "rssi", "int32", "Signal strength at the station, dBm" },
+    [AP_SILENT] = { "silent", "bool",
+                    "Beacon and answer probes but ignore authentication" },
+    [AP_UPLINK] = { "uplink", "bool",
+                    "Forward station traffic other than ARP and DHCP" },
+};
+
+#define AP_OPAQUE(i, p) ((void *)(uintptr_t)((i) << 8 | (p)))
+#define AP_INDEX(o)     ((uintptr_t)(o) >> 8)
+#define AP_PROP(o)      ((uintptr_t)(o) & 0xff)
+
+static void esp_wifi_get_ap(Object *obj, Visitor *v, const char *name,
+                            void *opaque, Error **errp)
+{
+    EspWifiAp *ap = &ESP_WIFI(obj)->ap[AP_INDEX(opaque)];
+    g_autofree char *str = NULL;
+
+    switch (AP_PROP(opaque)) {
+    case AP_SSID:
+    case AP_PSK:
+        str = g_strdup(AP_PROP(opaque) == AP_SSID ? ap->ssid : ap->psk);
+        if (!str) {
+            str = g_strdup("");
+        }
+        visit_type_str(v, name, &str, errp);
+        break;
+    case AP_CHANNEL:
+        visit_type_uint32(v, name, &ap->channel, errp);
+        break;
+    case AP_RSSI:
+        visit_type_int32(v, name, &ap->rssi, errp);
+        break;
+    case AP_SILENT:
+        visit_type_bool(v, name, &ap->silent, errp);
+        break;
+    case AP_UPLINK:
+        visit_type_bool(v, name, &ap->uplink, errp);
+        break;
+    }
+}
+
+static void esp_wifi_set_ap(Object *obj, Visitor *v, const char *name,
+                            void *opaque, Error **errp)
+{
+    EspWifiState *s = ESP_WIFI(obj);
+    int i = AP_INDEX(opaque);
+    EspWifiAp *ap = &s->ap[i];
+    char *str, **field;
+    uint32_t channel;
+
+    switch (AP_PROP(opaque)) {
+    case AP_SSID:
+    case AP_PSK:
+        if (!visit_type_str(v, name, &str, errp)) {
+            return;
+        }
+        if (AP_PROP(opaque) == AP_SSID && strlen(str) > 32) {
+            error_setg(errp, "%s must be at most 32 characters", name);
+            g_free(str);
+            return;
+        }
+        if (AP_PROP(opaque) == AP_PSK && *str &&
+            (strlen(str) < 8 || strlen(str) > 63)) {
+            error_setg(errp, "%s must be 8 to 63 characters", name);
+            g_free(str);
+            return;
+        }
+        field = AP_PROP(opaque) == AP_SSID ? &ap->ssid : &ap->psk;
+        if (!g_strcmp0(*field ? *field : "", str)) {
+            g_free(str);
+            return;
+        }
+        g_free(*field);
+        *field = str;
+        break;
+    case AP_CHANNEL:
+        if (!visit_type_uint32(v, name, &channel, errp)) {
+            return;
+        }
+        if (channel < 1 || channel > 14) {
+            error_setg(errp, "%s must be between 1 and 14", name);
+            return;
+        }
+        if (channel == ap->channel) {
+            return;
+        }
+        ap->channel = channel;
+        break;
+    /* These take effect on the next frame without dropping the link */
+    case AP_RSSI:
+        visit_type_int32(v, name, &ap->rssi, errp);
+        return;
+    case AP_SILENT:
+        visit_type_bool(v, name, &ap->silent, errp);
+        return;
+    case AP_UPLINK:
+        visit_type_bool(v, name, &ap->uplink, errp);
+        return;
+    }
+    if (DEVICE(obj)->realized) {
+        esp_wifi_air_ap_changed(s, i, errp);
+    }
 }
 
 static Property esp_wifi_properties[] = {
     DEFINE_NIC_PROPERTIES(EspWifiState, conf),
-    DEFINE_PROP_STRING("ap0-ssid", EspWifiState, ap[0].ssid),
-    DEFINE_PROP_STRING("ap0-psk", EspWifiState, ap[0].psk),
-    DEFINE_PROP_UINT32("ap0-channel", EspWifiState, ap[0].channel, 1),
-    DEFINE_PROP_INT32("ap0-rssi", EspWifiState, ap[0].rssi, -40),
-    DEFINE_PROP_STRING("ap1-ssid", EspWifiState, ap[1].ssid),
-    DEFINE_PROP_STRING("ap1-psk", EspWifiState, ap[1].psk),
-    DEFINE_PROP_UINT32("ap1-channel", EspWifiState, ap[1].channel, 1),
-    DEFINE_PROP_INT32("ap1-rssi", EspWifiState, ap[1].rssi, -40),
-    DEFINE_PROP_STRING("ap2-ssid", EspWifiState, ap[2].ssid),
-    DEFINE_PROP_STRING("ap2-psk", EspWifiState, ap[2].psk),
-    DEFINE_PROP_UINT32("ap2-channel", EspWifiState, ap[2].channel, 1),
-    DEFINE_PROP_INT32("ap2-rssi", EspWifiState, ap[2].rssi, -40),
-    DEFINE_PROP_STRING("ap3-ssid", EspWifiState, ap[3].ssid),
-    DEFINE_PROP_STRING("ap3-psk", EspWifiState, ap[3].psk),
-    DEFINE_PROP_UINT32("ap3-channel", EspWifiState, ap[3].channel, 1),
-    DEFINE_PROP_INT32("ap3-rssi", EspWifiState, ap[3].rssi, -40),
     DEFINE_PROP_STRING("client-psk", EspWifiState, client_psk),
     DEFINE_PROP_UINT32("ack-timeout-us", EspWifiState, ack_timeout_us, 20000),
     DEFINE_PROP_UINT32("beacon-interval", EspWifiState, beacon_interval_tu,
@@ -636,6 +757,7 @@ static void esp_wifi_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
+    int i, p;
 
     dc->realize = esp_wifi_realize;
     dc->desc = "Espressif Wi-Fi MAC";
@@ -643,6 +765,19 @@ static void esp_wifi_class_init(ObjectClass *klass, void *data)
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
     device_class_set_props(dc, esp_wifi_properties);
     rc->phases.hold = esp_wifi_reset_hold;
+
+    for (i = 0; i < ESP_WIFI_MAX_APS; i++) {
+        for (p = 0; p < ARRAY_SIZE(ap_props); p++) {
+            g_autofree char *name = g_strdup_printf("ap%d-%s", i,
+                                                    ap_props[p].name);
+
+            object_class_property_add(klass, name, ap_props[p].type,
+                                      esp_wifi_get_ap, esp_wifi_set_ap, NULL,
+                                      AP_OPAQUE(i, p));
+            object_class_property_set_description(klass, name,
+                                                  ap_props[p].desc);
+        }
+    }
 }
 
 static const TypeInfo esp_wifi_info = {
@@ -650,6 +785,7 @@ static const TypeInfo esp_wifi_info = {
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(EspWifiState),
     .instance_init = esp_wifi_init,
+    .instance_finalize = esp_wifi_finalize,
     .class_size = sizeof(EspWifiClass),
     .class_init = esp_wifi_class_init,
     .abstract = true,

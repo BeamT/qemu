@@ -69,11 +69,25 @@ the type name contains a dot, use the long form of `-global`:
 | `apN-channel` | 1 | Channel 1–14; the AP is only heard on its channel |
 | `apN-rssi` | −40 | Signal strength reported to the guest, in dBm |
 | `apN-psk` | unset | WPA2-PSK passphrase (8–63 characters); unset is an open network |
+| `apN-silent` | off | Beacons and answers probes but ignores authentication, so the station's attempts expire |
+| `apN-uplink` | on | Off: only ARP and DHCP pass, so the station gets an address but reaches nothing |
 | `client-psk` | unset | Passphrase used by the emulated clients of a WPA2 SoftAP |
 | `ack-timeout-us` | 20000 | How long a unicast ESP-NOW frame waits for its ACK |
 | `beacon-interval` | 100 | Beacon interval of the emulated APs, in TU |
 
 The BSSID of access point N is `12:01:00:c4:0a:5N`.
+
+The access point properties can also be changed while the guest runs, with
+`qom-set` on the QMP monitor (`-qmp unix:/tmp/qmp.sock,server=on,wait=off`).
+Changing the SSID, passphrase or channel of the AP the station joined
+deauthenticates it (reason 3), as an access point does when reconfigured;
+`rssi`, `silent` and `uplink` apply from the next frame. The device has no
+id, so find its path with `qom-list` (e.g. `/machine/unattached/device[1]`):
+
+```
+{ "execute": "qom-set", "arguments": { "path": "/machine/unattached/device[1]",
+  "property": "ap0-psk", "value": "new-passphrase" } }
+```
 
 ## Station mode
 

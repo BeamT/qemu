@@ -61,6 +61,7 @@ bool esp_wifi_air_tx(EspWifiState *s, int slot, const uint8_t *frame,
                      size_t len);
 void esp_wifi_air_rx_eth(EspWifiState *s, const uint8_t *buf, size_t len);
 void esp_wifi_air_channel_changed(EspWifiState *s);
+void esp_wifi_air_ap_changed(EspWifiState *s, int i, Error **errp);
 
 static inline uint16_t wlan_fc(const uint8_t *f)
 {

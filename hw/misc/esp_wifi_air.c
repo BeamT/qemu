@@ -38,6 +38,7 @@
 #include "crypto/hmac.h"
 #include "crypto/pbkdf.h"
 #include "crypto/cipher.h"
+#include "net/eth.h"
 #include "hw/misc/esp_wifi.h"
 #include "esp_wifi_int.h"
 #include "trace.h"
@@ -408,6 +409,16 @@ static bool ap_on_air(EspWifiState *s, const EspWifiAp *ap)
     return ap_configured(ap) && (!s->channel || ap->channel == s->channel);
 }
 
+static bool ap_derive_pmk(EspWifiAp *ap, int i, Error **errp)
+{
+    if (ap_configured(ap) && ap_rsn(ap) &&
+        !wpa_pmk(ap->psk, ap->ssid, ap->pmk)) {
+        error_setg(errp, "cannot derive the WPA2 key of ap%d", i);
+        return false;
+    }
+    return true;
+}
+
 static EspWifiAp *ap_by_bssid(EspWifiState *s, const uint8_t *bssid)
 {
     int i;
@@ -604,7 +615,8 @@ static void ap_rx_mgmt(EspWifiState *s, EspWifiAp *ap, unsigned subtype,
 
     switch (subtype) {
     case WLAN_MGMT_AUTH:
-        if (blen < 6 || lduw_le_p(body) != 0 || lduw_le_p(body + 2) != 1) {
+        if (ap->silent ||
+            blen < 6 || lduw_le_p(body) != 0 || lduw_le_p(body + 2) != 1) {
             break;
         }
         memcpy(ap->sta.a, f + 10, 6);
@@ -678,6 +690,24 @@ static void esp_wifi_beacon_timer(void *opaque)
     }
     timer_mod(s->beacon_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               (int64_t)s->beacon_interval_tu * TU_NS);
+}
+
+/*
+ * What a station still exchanges through an access point with no uplink:
+ * ARP and DHCP, so it associates and gets an address but reaches nothing.
+ */
+static bool ap_local_traffic(uint16_t ethertype, const uint8_t *p, size_t len)
+{
+    size_t ihl;
+
+    if (ethertype == ETH_P_ARP) {
+        return true;
+    }
+    if (ethertype != ETH_P_IP || len < 20 || p[9] != IP_PROTO_UDP) {
+        return false;
+    }
+    ihl = (p[0] & 0xf) * 4;
+    return len >= ihl + 4 && lduw_be_p(p + ihl + 2) == 67;
 }
 
 /* Payload of a data frame: skip the header and check the LLC/SNAP header */
@@ -1151,7 +1181,8 @@ bool esp_wifi_air_tx(EspWifiState *s, int slot, const uint8_t *f, size_t len)
     if (ap) {
         if (ethertype == ETH_P_EAPOL) {
             ap_rx_eapol(s, ap, payload, plen);
-        } else if (ap->link == ESP_WIFI_LINK_ESTABLISHED) {
+        } else if (ap->link == ESP_WIFI_LINK_ESTABLISHED &&
+                   (ap->uplink || ap_local_traffic(ethertype, payload, plen))) {
             send_eth(s, a3, a2, ethertype, payload, plen);
         }
         return false;
@@ -1240,6 +1271,27 @@ void esp_wifi_air_channel_changed(EspWifiState *s)
     }
 }
 
+/*
+ * ap@i was reconfigured while the guest runs. Access points do not keep their
+ * stations across that, so deauthenticate the guest if it joined this one.
+ */
+void esp_wifi_air_ap_changed(EspWifiState *s, int i, Error **errp)
+{
+    EspWifiAp *ap = &s->ap[i];
+    uint8_t reason[2];
+
+    if (ap->link != ESP_WIFI_LINK_NONE) {
+        stw_le_p(reason, 3);            /* AP leaving */
+        ap_send_mgmt(s, ap, WLAN_MGMT_DEAUTH, reason, sizeof(reason), false);
+        ap->link = ESP_WIFI_LINK_NONE;
+        ap->eapol_msg = 0;
+        memset(&ap->keys, 0, sizeof(ap->keys));
+        trace_esp_wifi_link(ap->ssid, ap->link);
+        ap_eapol_rearm(s);
+    }
+    ap_derive_pmk(ap, i, errp);
+}
+
 void esp_wifi_air_reset(EspWifiState *s)
 {
     int i;
@@ -1272,27 +1324,14 @@ void esp_wifi_air_realize(EspWifiState *s, Error **errp)
         /* Locally administered BSSIDs */
         ap->bssid = (MACAddr) { .a = { 0x12, 0x01, 0x00, 0xc4, 0x0a,
                                        0x50 + i } };
-        if (ap->channel < 1 || ap->channel > 14) {
-            error_setg(errp, "ap%d-channel must be between 1 and 14", i);
-            return;
-        }
     }
     if (!any) {
         g_free(s->ap[0].ssid);
         s->ap[0].ssid = g_strdup("Espressif");
     }
     for (i = 0; i < ESP_WIFI_MAX_APS; i++) {
-        EspWifiAp *ap = &s->ap[i];
-
-        if (ap_configured(ap) && ap_rsn(ap)) {
-            if (strlen(ap->psk) < 8 || strlen(ap->psk) > 63) {
-                error_setg(errp, "ap%d-psk must be 8 to 63 characters", i);
-                return;
-            }
-            if (!wpa_pmk(ap->psk, ap->ssid, ap->pmk)) {
-                error_setg(errp, "cannot derive the WPA2 key of ap%d", i);
-                return;
-            }
+        if (!ap_derive_pmk(&s->ap[i], i, errp)) {
+            return;
         }
     }
     s->beacon_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp_wifi_beacon_timer,
