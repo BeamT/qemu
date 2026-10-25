@@ -159,6 +159,8 @@ typedef struct Esp32s3SocState {
     SsiPsramState *psram;
     MemoryRegion wifi_rst_en;
     uint32_t syscon_wifi_rst_en;
+    MemoryRegion perip_rst_en_mr;
+    uint32_t perip_rst_en[2];
 
     uint32_t requested_reset;
 } Esp32s3SocState;
@@ -170,6 +172,15 @@ typedef struct Esp32s3SocState {
 /* SYSCON_WIFI_RST_EN, also known as SYSTEM_CORE_RST_EN */
 #define A_SYSCON_WIFI_RST_EN    0x018
 #define SYSCON_WIFIMAC_RST      BIT(2)
+
+/* SYSTEM_PERIP_RST_EN0 and _EN1, and the UART reset bit of each UART */
+#define A_SYSTEM_PERIP_RST_EN   0x020
+static const struct {
+    int reg;
+    uint32_t bit;
+} uart_rst[ESP32S3_UART_COUNT] = {
+    { 0, BIT(2) }, { 0, BIT(5) }, { 1, BIT(9) },
+};
 
 /* "QEMU" as a 32-bit value, can be used by the application to to check whether it is running in
  * QEMU or on real hardware */
@@ -241,6 +252,43 @@ static const MemoryRegionOps esp32s3_wifi_rst_en_ops = {
     .valid.max_access_size = 4,
 };
 
+/*
+ * The UART driver resets a UART through SYSTEM_PERIP_RST_EN0/1 when it
+ * first enables it. Without that, a UART left configured by the previous
+ * boot (esp_restart() resets only UART0) keeps its interrupt enables and
+ * FIFO contents, and its interrupt fires before the driver is ready.
+ */
+static uint64_t esp32s3_perip_rst_en_read(void *opaque, hwaddr addr,
+                                          unsigned int size)
+{
+    Esp32s3SocState *s = opaque;
+
+    return s->perip_rst_en[addr / 4];
+}
+
+static void esp32s3_perip_rst_en_write(void *opaque, hwaddr addr,
+                                       uint64_t value, unsigned int size)
+{
+    Esp32s3SocState *s = opaque;
+    int reg = addr / 4;
+    uint32_t rising = value & ~s->perip_rst_en[reg];
+
+    for (int i = 0; i < ESP32S3_UART_COUNT; i++) {
+        if (uart_rst[i].reg == reg && (rising & uart_rst[i].bit)) {
+            device_cold_reset(DEVICE(&s->uart[i]));
+        }
+    }
+    s->perip_rst_en[reg] = value;
+}
+
+static const MemoryRegionOps esp32s3_perip_rst_en_ops = {
+    .read = esp32s3_perip_rst_en_read,
+    .write = esp32s3_perip_rst_en_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
 static void esp32s3_soc_reset(DeviceState *dev)
 {
     Esp32s3SocState *s = ESP32S3_SOC(dev);
@@ -256,6 +304,7 @@ static void esp32s3_soc_reset(DeviceState *dev)
             device_cold_reset(s->wifi);
         }
         s->syscon_wifi_rst_en = 0;
+        memset(s->perip_rst_en, 0, sizeof(s->perip_rst_en));
     }
     if (s->requested_reset & ESP32S3_SOC_RESET_PROCPU) {
         xtensa_select_static_vectors(&s->cpu[0].env, s->rtc_cntl.stat_vector_sel[0]);
@@ -810,6 +859,12 @@ static void esp32s3_machine_init(MachineState *machine)
         sysbus_realize(SYS_BUS_DEVICE(&ss->clock), &error_fatal);
         MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->clock), 0);
         memory_region_add_subregion_overlap(sys_mem, DR_REG_SYSTEM_BASE, mr, 0);
+        memory_region_init_io(&ss->perip_rst_en_mr, OBJECT(ss),
+                              &esp32s3_perip_rst_en_ops, ss,
+                              "esp32s3.system.perip_rst_en", 8);
+        memory_region_add_subregion_overlap(sys_mem, DR_REG_SYSTEM_BASE +
+                                            A_SYSTEM_PERIP_RST_EN,
+                                            &ss->perip_rst_en_mr, 1);
         /* Connect the IRQ lines to the interrupt matrix */
         for (int i = 0; i < ESP32S3_SYSTEM_CPU_INTR_COUNT; i++) {
             sysbus_connect_irq(SYS_BUS_DEVICE(&ss->clock), i,
