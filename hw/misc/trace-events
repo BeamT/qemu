@@ -374,6 +374,7 @@ esp_wifi_mac_write(uint64_t addr, uint64_t value) "0x%03" PRIx64 " <- 0x%08" PRI
 esp_wifi_radio_read(const char *block, uint64_t addr, uint64_t value) "%s 0x%03" PRIx64 " -> 0x%08" PRIx64
 esp_wifi_radio_write(const char *block, uint64_t addr, uint64_t value) "%s 0x%03" PRIx64 " <- 0x%08" PRIx64
 esp_wifi_channel(uint32_t old, uint32_t new) "channel %" PRIu32 " -> %" PRIu32
+esp_wifi_reset(void) ""
 esp_wifi_tx(int slot, size_t len, uint32_t plcp_len, uint16_t fc) "slot %d len %zu plcp len %" PRIu32 " fc 0x%04x"
 esp_wifi_tx_done(int slot, bool acked) "slot %d acked %d"
 esp_wifi_rx(uint32_t desc, uint32_t len, uint16_t fc) "descriptor 0x%08" PRIx32 " len %" PRIu32 " fc 0x%04x"

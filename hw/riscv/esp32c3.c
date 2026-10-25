@@ -102,6 +102,7 @@ struct Esp32C3MachineState {
 #define A_SYSCON_RND_DATA_REG   0x0B0
 #define A_SYSCON_WIFI_CLK_EN_REG 0x014
 #define A_SYSCON_WIFI_RST_EN_REG 0x018
+#define SYSCON_WIFIMAC_RST      BIT(2)
 #define SYSCON_WIFI_CLK_EN_RESET 0xfffce030
 
 /* Temporary macro to mark the CPU as in non-debugging mode */
@@ -194,6 +195,11 @@ static void esp32c3_io_write(void *opaque, hwaddr addr, uint64_t value, unsigned
         ms->syscon_wifi_clk_en = value;
         return;
     } else if (syscon == A_SYSCON_WIFI_RST_EN_REG) {
+        /* esp_restart() pulses the MAC reset before resetting the CPU */
+        if (ms->wifi &&
+            (value & ~ms->syscon_wifi_rst_en & SYSCON_WIFIMAC_RST)) {
+            device_cold_reset(ms->wifi);
+        }
         ms->syscon_wifi_rst_en = value;
         return;
     }

@@ -157,6 +157,8 @@ typedef struct Esp32s3SocState {
     DeviceState *eth;
     DeviceState *wifi;
     SsiPsramState *psram;
+    MemoryRegion wifi_rst_en;
+    uint32_t syscon_wifi_rst_en;
 
     uint32_t requested_reset;
 } Esp32s3SocState;
@@ -164,6 +166,10 @@ typedef struct Esp32s3SocState {
 
 /* Temporary macro to mark the CPU as in non-debugging mode */
 #define A_ASSIST_DEBUG_CORE_0_DEBUG_MODE_REG    0x098
+
+/* SYSCON_WIFI_RST_EN, also known as SYSTEM_CORE_RST_EN */
+#define A_SYSCON_WIFI_RST_EN    0x018
+#define SYSCON_WIFIMAC_RST      BIT(2)
 
 /* "QEMU" as a 32-bit value, can be used by the application to to check whether it is running in
  * QEMU or on real hardware */
@@ -202,6 +208,39 @@ static void esp32s3_cpu_reset(void* opaque, int n, int level)
     }
 }
 
+/*
+ * esp_restart() pulses the Wi-Fi MAC reset before resetting only the CPU. A
+ * MAC left running would keep writing received frames into the next boot's
+ * memory and holding its interrupt, which hangs the new boot once that
+ * interrupt line is enabled.
+ */
+static uint64_t esp32s3_wifi_rst_en_read(void *opaque, hwaddr addr,
+                                         unsigned int size)
+{
+    Esp32s3SocState *s = opaque;
+
+    return s->syscon_wifi_rst_en;
+}
+
+static void esp32s3_wifi_rst_en_write(void *opaque, hwaddr addr,
+                                      uint64_t value, unsigned int size)
+{
+    Esp32s3SocState *s = opaque;
+
+    if (s->wifi && (value & ~s->syscon_wifi_rst_en & SYSCON_WIFIMAC_RST)) {
+        device_cold_reset(s->wifi);
+    }
+    s->syscon_wifi_rst_en = value;
+}
+
+static const MemoryRegionOps esp32s3_wifi_rst_en_ops = {
+    .read = esp32s3_wifi_rst_en_read,
+    .write = esp32s3_wifi_rst_en_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
 static void esp32s3_soc_reset(DeviceState *dev)
 {
     Esp32s3SocState *s = ESP32S3_SOC(dev);
@@ -216,6 +255,7 @@ static void esp32s3_soc_reset(DeviceState *dev)
         if (s->wifi) {
             device_cold_reset(s->wifi);
         }
+        s->syscon_wifi_rst_en = 0;
     }
     if (s->requested_reset & ESP32S3_SOC_RESET_PROCPU) {
         xtensa_select_static_vectors(&s->cpu[0].env, s->rtc_cntl.stat_vector_sel[0]);
@@ -475,6 +515,12 @@ static void esp32s3_soc_realize(DeviceState *dev, Error **errp)
     uint32_t qemu_sig = RGB_QEMU_ORIGIN;
     cpu_physical_memory_write(apb_ctrl_regs + 0x7c, &apb_ctrl_date_reg_val, 4);
     cpu_physical_memory_write(apb_ctrl_regs + RGB_QEMU_ORIGIN_REG, &qemu_sig, 4);
+    memory_region_init_io(&s->wifi_rst_en, OBJECT(dev),
+                          &esp32s3_wifi_rst_en_ops, s,
+                          "esp32s3.syscon.wifi_rst_en", 4);
+    memory_region_add_subregion_overlap(sys_mem,
+                                        apb_ctrl_regs + A_SYSCON_WIFI_RST_EN,
+                                        &s->wifi_rst_en, 1);
 
     qemu_register_reset((QEMUResetHandler*) esp32s3_soc_reset, dev);
 

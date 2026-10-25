@@ -531,6 +531,7 @@ static void esp_wifi_reset_hold(Object *obj, ResetType type)
     EspWifiClass *k = esp_wifi_get_class(s);
     unsigned i;
 
+    trace_esp_wifi_reset();
     memset(s->mac_regs, 0, layout(s)->size);
     for (i = 1; i < k->n_radio; i++) {
         uint32_t n = k->radio[i].size / 4;
