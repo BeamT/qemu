@@ -1,0 +1,4 @@
+# Host side of the Bluetooth tests: Rootcanal virtual controllers and a
+# Bumble host playing the phone
+bumble==0.0.236
+rootcanal==1.13.0

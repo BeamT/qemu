@@ -43,7 +43,7 @@ jobs:
     env:
       # A simple way to spread several environments for Windows. But to be more precise, we need to somehow add different envs to matrix.include
 
-      MSYSTEM: MINGW64  # Ref: https://www.msys2.org/docs/environments/
+      MSYSTEM: UCRT64  # Ref: https://www.msys2.org/docs/environments/
       CHERE_INVOKING: 'yes'
       MSYS: 'winsymlinks:native'
     strategy:
@@ -112,20 +112,21 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           cache: true
-          msystem: MINGW64
+          # MSYS2 no longer builds libslirp for MINGW64
+          msystem: UCRT64
           install: >-
             diffutils
             git
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-glib2
-            mingw-w64-x86_64-libgcrypt
-            mingw-w64-x86_64-libiconv
-            mingw-w64-x86_64-libslirp
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-pixman
-            mingw-w64-x86_64-pkg-config
-            mingw-w64-x86_64-python
-            mingw-w64-x86_64-SDL2
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-libgcrypt
+            mingw-w64-ucrt-x86_64-libiconv
+            mingw-w64-ucrt-x86_64-libslirp
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pixman
+            mingw-w64-ucrt-x86_64-pkg-config
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-SDL2
 
       - name: Configure (${{ matrix.target }} @ ${{ matrix.platform }})
         env:
@@ -178,6 +179,53 @@ jobs:
           name: dist-qemu-${{ matrix.target }}-${{ matrix.platform }}
           path: |
             dist/
+
+  BluetoothTests:
+    # Run a NimBLE host-only app on the Linux build, with its HCI UART on a
+    # Rootcanal virtual controller
+    needs: [ Build ]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        idf: [ 'v6.1', 'v6.0.3', 'v5.5.6' ]
+    container:
+      image: espressif/idf:${{ matrix.idf }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-qemu-*-x86_64-linux-gnu
+          path: dist
+          merge-multiple: true
+
+      - name: Unpack QEMU
+        run: |
+          mkdir -p qemu-dist
+          for f in dist/*.tar.xz; do tar -xJf "$f" -C qemu-dist; done
+          apt-get update && apt-get install -y --no-install-recommends libsdl2-2.0-0 libslirp0 libpixman-1-0 libgcrypt20
+
+      - name: Install Bumble and Rootcanal
+        run: |
+          python3 -m venv /opt/bt-venv
+          /opt/bt-venv/bin/pip install -r tests/esp_bt/requirements.txt
+
+      - name: Run the Bluetooth tests
+        run: |
+          /opt/bt-venv/bin/python tests/esp_bt/run_tests.py --idf "$IDF_PATH" \
+              --qemu-dir qemu-dist/qemu/bin --work bt-work \
+              --report bt-report-${{ matrix.idf }}.md
+
+      - name: Upload the report and logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bt-tests-${{ matrix.idf }}
+          path: |
+            bt-report-*.md
+            bt-work/runs/
 
   Upload:
     if: startsWith(github.ref, 'refs/tags/')
