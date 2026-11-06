@@ -129,6 +129,7 @@ typedef struct EspWifiAp {
     int32_t rssi;
     bool silent;                /* beacons, but ignores authentication */
     bool uplink;                /* false: only ARP and DHCP get through */
+    bool dhcp;                  /* false: the DHCP server does not answer */
     MACAddr bssid;
     MACAddr sta;                /* the guest station using this AP */
     uint8_t pmk[32];

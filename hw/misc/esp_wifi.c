@@ -607,6 +607,7 @@ static void esp_wifi_init(Object *obj)
         s->ap[i].channel = 1;
         s->ap[i].rssi = -40;
         s->ap[i].uplink = true;
+        s->ap[i].dhcp = true;
     }
     esp_wifi_air_init(s);
 }
@@ -627,7 +628,7 @@ static void esp_wifi_finalize(Object *obj)
  * that they can be changed while the guest runs (qom-set), e.g. to take a
  * network off the air or change its passphrase.
  */
-enum { AP_SSID, AP_PSK, AP_CHANNEL, AP_RSSI, AP_SILENT, AP_UPLINK };
+enum { AP_SSID, AP_PSK, AP_CHANNEL, AP_RSSI, AP_SILENT, AP_UPLINK, AP_DHCP };
 
 static const struct {
     const char *name, *type, *desc;
@@ -640,6 +641,8 @@ static const struct {
                     "Beacon and answer probes but ignore authentication" },
     [AP_UPLINK] = { "uplink", "bool",
                     "Forward station traffic other than ARP and DHCP" },
+    [AP_DHCP] = { "dhcp", "bool",
+                  "Forward the station's DHCP requests to the DHCP server" },
 };
 
 #define AP_OPAQUE(i, p) ((void *)(uintptr_t)((i) << 8 | (p)))
@@ -672,6 +675,9 @@ static void esp_wifi_get_ap(Object *obj, Visitor *v, const char *name,
         break;
     case AP_UPLINK:
         visit_type_bool(v, name, &ap->uplink, errp);
+        break;
+    case AP_DHCP:
+        visit_type_bool(v, name, &ap->dhcp, errp);
         break;
     }
 }
@@ -732,6 +738,9 @@ static void esp_wifi_set_ap(Object *obj, Visitor *v, const char *name,
         return;
     case AP_UPLINK:
         visit_type_bool(v, name, &ap->uplink, errp);
+        return;
+    case AP_DHCP:
+        visit_type_bool(v, name, &ap->dhcp, errp);
         return;
     }
     if (DEVICE(obj)->realized) {

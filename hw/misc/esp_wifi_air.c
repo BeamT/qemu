@@ -710,6 +710,12 @@ static bool ap_local_traffic(uint16_t ethertype, const uint8_t *p, size_t len)
     return len >= ihl + 4 && lduw_be_p(p + ihl + 2) == 67;
 }
 
+/* A DHCP request from the station: UDP to the server port, 67 */
+static bool is_dhcp_request(uint16_t ethertype, const uint8_t *p, size_t len)
+{
+    return ethertype == ETH_P_IP && ap_local_traffic(ethertype, p, len);
+}
+
 /* Payload of a data frame: skip the header and check the LLC/SNAP header */
 static const uint8_t *data_payload(const uint8_t *f, size_t len,
                                    uint16_t *ethertype, size_t *plen)
@@ -1182,6 +1188,7 @@ bool esp_wifi_air_tx(EspWifiState *s, int slot, const uint8_t *f, size_t len)
         if (ethertype == ETH_P_EAPOL) {
             ap_rx_eapol(s, ap, payload, plen);
         } else if (ap->link == ESP_WIFI_LINK_ESTABLISHED &&
+                   (ap->dhcp || !is_dhcp_request(ethertype, payload, plen)) &&
                    (ap->uplink || ap_local_traffic(ethertype, payload, plen))) {
             send_eth(s, a3, a2, ethertype, payload, plen);
         }
