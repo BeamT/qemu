@@ -116,6 +116,7 @@ config RISCV_ESP32C3
     bool
     default y
     depends on RISCV32
+    select ESP_WIFI
     select OPENCORES_ETH
     select UNIMP
     select ESP_RGB

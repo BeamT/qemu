@@ -20,6 +20,7 @@
 #include "hw/sysbus.h"
 #include "hw/xtensa/xtensa_memory.h"
 #include "hw/misc/unimp.h"
+#include "hw/misc/esp32c3_wifi.h"
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/qdev-properties.h"
@@ -53,6 +54,8 @@
 #include "hw/nvram/esp32s3_efuse.h"
 #include "hw/xtensa/esp32s3_clk.h"
 #include "hw/dma/esp32s3_gdma.h"
+#include "hw/i2c/esp32s3_i2c.h"
+#include "hw/misc/esp32s3_lcd_cam.h"
 #include "hw/misc/esp32s3_sha.h"
 #include "hw/misc/esp32s3_aes.h"
 #include "hw/misc/esp32s3_rsa.h"
@@ -137,6 +140,8 @@ typedef struct Esp32s3SocState {
     ESP32S3EfuseState efuse;
     ESP32S3ClockState clock;
     ESP32S3GdmaState gdma;
+    ESP32S3I2CState i2c[ESP32S3_I2C_COUNT];
+    ESP32S3LcdCamState lcd_cam;
     ESP32S3ShaState sha;
     ESP32S3AesState aes;
     ESP32S3RsaState rsa;
@@ -154,7 +159,12 @@ typedef struct Esp32s3SocState {
     MemoryRegion iomem;
     DWCSDMMCState sdmmc;
     DeviceState *eth;
+    DeviceState *wifi;
     SsiPsramState *psram;
+    MemoryRegion wifi_rst_en;
+    uint32_t syscon_wifi_rst_en;
+    MemoryRegion perip_rst_en_mr;
+    uint32_t perip_rst_en[2];
 
     uint32_t requested_reset;
 } Esp32s3SocState;
@@ -162,6 +172,13 @@ typedef struct Esp32s3SocState {
 
 /* Temporary macro to mark the CPU as in non-debugging mode */
 #define A_ASSIST_DEBUG_CORE_0_DEBUG_MODE_REG    0x098
+
+/* SYSCON_WIFI_RST_EN, also known as SYSTEM_CORE_RST_EN */
+#define A_SYSCON_WIFI_RST_EN    0x018
+#define SYSCON_WIFIMAC_RST      BIT(2)
+
+/* SYSTEM_PERIP_RST_EN0 and _EN1 */
+#define A_SYSTEM_PERIP_RST_EN   0x020
 
 /* "QEMU" as a 32-bit value, can be used by the application to to check whether it is running in
  * QEMU or on real hardware */
@@ -200,6 +217,89 @@ static void esp32s3_cpu_reset(void* opaque, int n, int level)
     }
 }
 
+/*
+ * esp_restart() pulses the Wi-Fi MAC reset before resetting only the CPU. A
+ * MAC left running would keep writing received frames into the next boot's
+ * memory and holding its interrupt, which hangs the new boot once that
+ * interrupt line is enabled.
+ */
+static uint64_t esp32s3_wifi_rst_en_read(void *opaque, hwaddr addr,
+                                         unsigned int size)
+{
+    Esp32s3SocState *s = opaque;
+
+    return s->syscon_wifi_rst_en;
+}
+
+static void esp32s3_wifi_rst_en_write(void *opaque, hwaddr addr,
+                                      uint64_t value, unsigned int size)
+{
+    Esp32s3SocState *s = opaque;
+
+    if (s->wifi && (value & ~s->syscon_wifi_rst_en & SYSCON_WIFIMAC_RST)) {
+        device_cold_reset(s->wifi);
+    }
+    s->syscon_wifi_rst_en = value;
+}
+
+static const MemoryRegionOps esp32s3_wifi_rst_en_ops = {
+    .read = esp32s3_wifi_rst_en_read,
+    .write = esp32s3_wifi_rst_en_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
+/*
+ * The UART driver resets a UART through SYSTEM_PERIP_RST_EN0/1 when it
+ * first enables it. Without that, a UART left configured by the previous
+ * boot (esp_restart() resets only UART0) keeps its interrupt enables and
+ * FIFO contents, and its interrupt fires before the driver is ready.
+ */
+static uint64_t esp32s3_perip_rst_en_read(void *opaque, hwaddr addr,
+                                          unsigned int size)
+{
+    Esp32s3SocState *s = opaque;
+
+    return s->perip_rst_en[addr / 4];
+}
+
+static void esp32s3_perip_rst_en_write(void *opaque, hwaddr addr,
+                                       uint64_t value, unsigned int size)
+{
+    Esp32s3SocState *s = opaque;
+    int reg = addr / 4;
+    uint32_t rising = value & ~s->perip_rst_en[reg];
+    /* The emulated peripherals reset through these registers, and their bits */
+    const struct {
+        int reg;
+        uint32_t bit;
+        DeviceState *dev;
+    } rst[] = {
+        { 0, BIT(2), DEVICE(&s->uart[0]) },
+        { 0, BIT(5), DEVICE(&s->uart[1]) },
+        { 1, BIT(9), DEVICE(&s->uart[2]) },
+        { 0, BIT(7), DEVICE(&s->i2c[0]) },
+        { 0, BIT(18), DEVICE(&s->i2c[1]) },
+        { 1, BIT(8), DEVICE(&s->lcd_cam) },
+    };
+
+    for (int i = 0; i < ARRAY_SIZE(rst); i++) {
+        if (rst[i].reg == reg && (rising & rst[i].bit)) {
+            device_cold_reset(rst[i].dev);
+        }
+    }
+    s->perip_rst_en[reg] = value;
+}
+
+static const MemoryRegionOps esp32s3_perip_rst_en_ops = {
+    .read = esp32s3_perip_rst_en_read,
+    .write = esp32s3_perip_rst_en_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+};
+
 static void esp32s3_soc_reset(DeviceState *dev)
 {
     Esp32s3SocState *s = ESP32S3_SOC(dev);
@@ -211,6 +311,11 @@ static void esp32s3_soc_reset(DeviceState *dev)
         for (int i = 0; i < ESP32S3_UART_COUNT; ++i) {
             device_cold_reset(DEVICE(&s->uart[i]));
         }
+        if (s->wifi) {
+            device_cold_reset(s->wifi);
+        }
+        s->syscon_wifi_rst_en = 0;
+        memset(s->perip_rst_en, 0, sizeof(s->perip_rst_en));
     }
     if (s->requested_reset & ESP32S3_SOC_RESET_PROCPU) {
         xtensa_select_static_vectors(&s->cpu[0].env, s->rtc_cntl.stat_vector_sel[0]);
@@ -320,6 +425,34 @@ struct Esp32s3MachineState {
     DeviceState *flash_dev;
 };
 #define TYPE_ESP32S3_MACHINE MACHINE_TYPE_NAME("esp32s3")
+
+static void esp32s3_wifi_map_region(void *opaque, hwaddr base, MemoryRegion *mr)
+{
+    /* Above the catch-all I/O region */
+    memory_region_add_subregion_overlap(opaque, base, mr, 1);
+}
+
+static void esp32s3_init_wifi(Esp32s3SocState *ss)
+{
+    DeviceState *dev = qemu_create_nic_device(TYPE_ESP32S3_WIFI, false, NULL);
+    MemoryRegion *rng;
+
+    if (!dev) {
+        return;
+    }
+    ss->wifi = dev;
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    esp_wifi_map(ESP_WIFI(dev), esp32s3_wifi_map_region, get_system_memory());
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in(DEVICE(&ss->intmatrix),
+                                        ETS_WIFI_MAC_INTR_SOURCE));
+
+    /* The RNG data register sits in the Wi-Fi WDEV block */
+    rng = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->rng), 0);
+    memory_region_del_subregion(get_system_memory(), rng);
+    memory_region_add_subregion_overlap(get_system_memory(), ESP32S3_RNG_BASE,
+                                        rng, 2);
+}
 
 static void esp32s3_init_openeth(Esp32s3SocState *ms)
 {
@@ -442,6 +575,12 @@ static void esp32s3_soc_realize(DeviceState *dev, Error **errp)
     uint32_t qemu_sig = RGB_QEMU_ORIGIN;
     cpu_physical_memory_write(apb_ctrl_regs + 0x7c, &apb_ctrl_date_reg_val, 4);
     cpu_physical_memory_write(apb_ctrl_regs + RGB_QEMU_ORIGIN_REG, &qemu_sig, 4);
+    memory_region_init_io(&s->wifi_rst_en, OBJECT(dev),
+                          &esp32s3_wifi_rst_en_ops, s,
+                          "esp32s3.syscon.wifi_rst_en", 4);
+    memory_region_add_subregion_overlap(sys_mem,
+                                        apb_ctrl_regs + A_SYSCON_WIFI_RST_EN,
+                                        &s->wifi_rst_en, 1);
 
     qemu_register_reset((QEMUResetHandler*) esp32s3_soc_reset, dev);
 
@@ -458,8 +597,19 @@ static void esp32s3_soc_realize(DeviceState *dev, Error **errp)
 }
 
 
+/*
+ * Temperature sensor control: conversions complete at once, with a raw value
+ * of 104, about 25 degrees C. The PHY calibration waits for it.
+ */
+#define A_SENS_SAR_TSENS_CTRL   (DR_REG_SENS_BASE + 0x50)
+#define SENS_TSENS_READY        BIT(8)
+#define SENS_TSENS_RAW_25C      104
+
 static uint64_t esp32s3_io_read(void *opaque, hwaddr addr, unsigned int size)
 {
+    if (addr + ESP32S3_IO_START_ADDR == A_SENS_SAR_TSENS_CTRL) {
+        return SENS_TSENS_READY | SENS_TSENS_RAW_25C;
+    }
 #if ESP32S3_IO_WARNING
     warn_report("[ESP32-S3] Unsupported read to $%08lx, size = %i\n", ESP32S3_IO_START_ADDR + addr, size);
 #endif
@@ -645,6 +795,10 @@ static void esp32s3_machine_init(MachineState *machine)
     object_initialize_child(OBJECT(ss), "clock", &ss->clock, TYPE_ESP32S3_CLOCK);
 
     object_initialize_child(OBJECT(ss), "gdma", &ss->gdma, TYPE_ESP32S3_GDMA);
+    object_initialize_child(OBJECT(ss), "i2c0", &ss->i2c[0], TYPE_ESP32S3_I2C);
+    object_initialize_child(OBJECT(ss), "i2c1", &ss->i2c[1], TYPE_ESP32S3_I2C);
+    object_initialize_child(OBJECT(ss), "lcd_cam", &ss->lcd_cam,
+                            TYPE_ESP32S3_LCD_CAM);
     object_initialize_child(OBJECT(ss), "sha", &ss->sha, TYPE_ESP32S3_SHA);
     object_initialize_child(OBJECT(ss), "aes", &ss->aes, TYPE_ESP32S3_AES);
     object_initialize_child(OBJECT(ss), "rsa", &ss->rsa, TYPE_ESP32S3_RSA);
@@ -720,6 +874,12 @@ static void esp32s3_machine_init(MachineState *machine)
         sysbus_realize(SYS_BUS_DEVICE(&ss->clock), &error_fatal);
         MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->clock), 0);
         memory_region_add_subregion_overlap(sys_mem, DR_REG_SYSTEM_BASE, mr, 0);
+        memory_region_init_io(&ss->perip_rst_en_mr, OBJECT(ss),
+                              &esp32s3_perip_rst_en_ops, ss,
+                              "esp32s3.system.perip_rst_en", 8);
+        memory_region_add_subregion_overlap(sys_mem, DR_REG_SYSTEM_BASE +
+                                            A_SYSTEM_PERIP_RST_EN,
+                                            &ss->perip_rst_en_mr, 1);
         /* Connect the IRQ lines to the interrupt matrix */
         for (int i = 0; i < ESP32S3_SYSTEM_CPU_INTR_COUNT; i++) {
             sysbus_connect_irq(SYS_BUS_DEVICE(&ss->clock), i,
@@ -781,10 +941,12 @@ static void esp32s3_machine_init(MachineState *machine)
 
     }
 
+    esp32s3_init_wifi(ss);
+
 
     /* GDMA Realization */
     {
-        object_property_set_link(OBJECT(&ss->gdma), "soc_mr", OBJECT(dram), &error_abort);
+        object_property_set_link(OBJECT(&ss->gdma), "soc_mr", OBJECT(sys_mem), &error_abort);
         sysbus_realize(SYS_BUS_DEVICE(&ss->gdma), &error_fatal);
         MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->gdma), 0);
         memory_region_add_subregion_overlap(sys_mem, DR_REG_GDMA_BASE, mr, 0);
@@ -796,6 +958,36 @@ static void esp32s3_machine_init(MachineState *machine)
                                         qdev_get_gpio_in(intmatrix_dev, ETS_DMA_OUT_CH0_INTR_SOURCE + i));
         }
    }
+
+    /* I2C controllers realization, see the OV5640 for a device on their bus */
+    {
+        static const hwaddr base[ESP32S3_I2C_COUNT] = {
+            DR_REG_I2C_EXT_BASE, DR_REG_I2C1_EXT_BASE,
+        };
+        static const int irq[ESP32S3_I2C_COUNT] = {
+            ETS_I2C_EXT0_INTR_SOURCE, ETS_I2C_EXT1_INTR_SOURCE,
+        };
+
+        for (int i = 0; i < ESP32S3_I2C_COUNT; i++) {
+            qdev_prop_set_uint8(DEVICE(&ss->i2c[i]), "port", i);
+            sysbus_realize(SYS_BUS_DEVICE(&ss->i2c[i]), &error_fatal);
+            SysBusDevice *sbd = SYS_BUS_DEVICE(&ss->i2c[i]);
+            memory_region_add_subregion_overlap(sys_mem, base[i],
+                                                sysbus_mmio_get_region(sbd, 0), 0);
+            sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(intmatrix_dev, irq[i]));
+        }
+    }
+
+    /* LCD_CAM realization: frames of a DVP sensor, received through the GDMA */
+    {
+        object_property_set_link(OBJECT(&ss->lcd_cam), "gdma", OBJECT(&ss->gdma),
+                                 &error_abort);
+        sysbus_realize(SYS_BUS_DEVICE(&ss->lcd_cam), &error_fatal);
+        MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->lcd_cam), 0);
+        memory_region_add_subregion_overlap(sys_mem, DR_REG_LCD_CAM_BASE, mr, 0);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&ss->lcd_cam), 0,
+                           qdev_get_gpio_in(intmatrix_dev, ETS_LCD_CAM_INTR_SOURCE));
+    }
 
     /* SHA realization */
     {

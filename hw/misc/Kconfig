@@ -216,3 +216,6 @@ config XLNX_VERSAL_TRNG
     bool
 
 source macio/Kconfig
+
+config ESP_WIFI
+    bool

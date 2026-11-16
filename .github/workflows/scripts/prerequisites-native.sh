@@ -4,7 +4,14 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND="noninteractive"
 
-apt-get update -y -q
+# Debian 11 left the security mirrors when its LTS ended: deb.debian.org
+# still serves a stale index whose packages are gone. Use the archive.
+if grep -q '^VERSION_CODENAME=bullseye' /etc/os-release; then
+    sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|' \
+        /etc/apt/sources.list
+fi
+
+apt-get update -y -q -o Acquire::Check-Valid-Until=false
 apt-get install -y -q --no-install-recommends \
     build-essential \
     git \

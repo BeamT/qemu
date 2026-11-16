@@ -1,0 +1,5 @@
+menu "ESP-NOW test"
+    config ESPNOW_TEST_ENCRYPT
+        bool "Encrypt unicast frames to the peer"
+        default n
+endmenu

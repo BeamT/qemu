@@ -122,6 +122,12 @@ static uint64_t esp32_dport_read(void *opaque, hwaddr addr, unsigned int size)
     case A_DPORT_SLAVE_SPI_CONFIG:
         r = s->slave_spi_config_reg;
         break;
+    case A_DPORT_WIFI_CLK_EN:
+        r = s->wifi_clk_en_reg;
+        break;
+    case A_DPORT_WIFI_RST_EN:
+        r = s->wifi_rst_en_reg;
+        break;
     }
 
     return r;
@@ -225,6 +231,12 @@ static void esp32_dport_write(void *opaque, hwaddr addr,
         s->slave_spi_config_reg = value;
         qemu_set_irq(s->flash_enc_en_gpio, FIELD_EX32(value, DPORT_SLAVE_SPI_CONFIG, SLAVE_SPI_ENCRYPT_ENABLE));
         qemu_set_irq(s->flash_dec_en_gpio, FIELD_EX32(value, DPORT_SLAVE_SPI_CONFIG, SLAVE_SPI_DECRYPT_ENABLE));
+        break;
+    case A_DPORT_WIFI_CLK_EN:
+        s->wifi_clk_en_reg = value;
+        break;
+    case A_DPORT_WIFI_RST_EN:
+        s->wifi_rst_en_reg = value;
         break;
     }
 }
@@ -373,6 +385,8 @@ static void esp32_dport_reset_hold(Object *obj, ResetType type)
     s->appcpu_reset_state = true;
     s->appcpu_stall_state = false;
     s->cache_ill_trap_en_reg = 0;
+    s->wifi_clk_en_reg = ESP32_DPORT_WIFI_CLK_EN_RESET;
+    s->wifi_rst_en_reg = 0;
     esp32_cache_reset(&s->cache_state[0]);
     esp32_cache_reset(&s->cache_state[1]);
     qemu_irq_lower(s->appcpu_stall_req);
