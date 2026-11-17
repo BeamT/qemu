@@ -25,6 +25,12 @@
 #   softap    the guest runs a WPA2 SoftAP on channel 6; a client joins it,
 #             gets a lease from the guest's DHCP server and fetches
 #             http://192.168.4.1/ from the guest.
+#   apsta     the guest runs its HT40 SoftAP on the home network's channel
+#             (the radio then sits on the centre of the 40 MHz pair) and its
+#             station joins the home network there, gets a lease and pings
+#             the host; a client of the SoftAP fetches 24 KB from the guest,
+#             many TCP segments under a block ack agreement. On hwsim the
+#             client is an HT station with power save on, like a phone.
 #
 # Build as yourself first (root has no IDF environment), then run as root:
 #
@@ -88,6 +94,12 @@ class Procs:
                              stdin=subprocess.DEVNULL, **kw)
         self.procs.append((name, p, out))
         return p
+
+    def stop_one(self, name):
+        for n, p, out in self.procs:
+            if n == name and p.poll() is None:
+                p.send_signal(signal.SIGTERM)
+                p.wait(5)
 
     def stop(self):
         for name, p, out in reversed(self.procs):
@@ -227,6 +239,38 @@ def t_softap(ctx, guest):
     return res
 
 
+BIG_LEN = 24 * 1024
+
+
+def t_apsta(ctx, guest):
+    res = {}
+    ch = ctx.home_channel
+    ctx.home_up()
+    if guest.ask(f'ap {DUO_SSID} {PSK} {ch}', r'AIR ap ESP_OK', 30) is None:
+        raise Fail('SoftAP did not start')
+    time.sleep(2)
+    t0 = time.monotonic()
+    m = guest.ask(f'join {ctx.home_ssid} {PSK}',
+                  r'AIR sta got ip (\d+\.\d+\.\d+\.\d+)', 90)
+    if not m:
+        raise Fail(f'station: no lease from {ctx.home_ssid} on channel {ch} '
+                   'while the HT40 SoftAP runs there')
+    res['join'] = f'{time.monotonic() - t0:.1f} s to {m.group(1)}'
+    m = guest.ask(f'ping {ctx.home_host} 5', r'AIR ping ok=(\d+)', 60)
+    if not m or int(m.group(1)) < 3:
+        raise Fail(f'station ping: {m.group(0) if m else "no answer"}')
+    res['ping'] = f'{m.group(1)}/5'
+    lease = ctx.duo_join()
+    res['client'] = f'lease {lease}'
+    body = ctx.duo_get('http://192.168.4.1/big')
+    if len(body) != BIG_LEN:
+        raise Fail(f'GET /big: {len(body)} of {BIG_LEN} bytes')
+    res['bulk'] = f'{len(body)} bytes'
+    guest.send('leave')
+    time.sleep(1)
+    return res
+
+
 # The hwsim medium
 
 def need(prog):
@@ -355,6 +399,7 @@ ctrl_interface={self.work / 'hostapd'}
         ctx.home_channel = 1
         ctx.home_host = f'{HOME_NET}.1'
         ctx.home_ping = self.home_ping
+        ctx.home_up = lambda: None
         ctx.home_pmf = self
         ctx.duo_join = self.duo_join
         ctx.duo_get = self.duo_get
@@ -403,6 +448,12 @@ network={{
     scan_ssid=1
 }}
 ''')
+        # A second join (the SoftAP restarted elsewhere): start afresh. The
+        # old wpa_supplicant would stay with the vanished BSS, whose
+        # connection monitor probes wmediumd acknowledges
+        self.procs.stop_one('wpa_supplicant')
+        sh(*self.ns('airsta', 'ip', 'addr', 'flush', 'dev', ifc),
+           check=False)
         self.procs.start('wpa_supplicant', self.ns(
             'airsta', 'wpa_supplicant', '-t', '-D', 'nl80211', '-i', ifc,
             '-c', str(conf)))
@@ -415,6 +466,9 @@ network={{
         else:
             raise Fail('wpa_supplicant did not join, see '
                        'wpa_supplicant.log')
+        # Like a phone: the access point must buffer for it and wake it
+        sh(*self.ns('airsta', 'iw', 'dev', ifc, 'set', 'power_save', 'on'),
+           check=False)
         script = self.work / 'udhcpc.sh'
         script.write_text('#!/bin/sh\n[ "$1" = bound ] && '
                           'ip addr add "$ip/$mask" dev "$interface"\n'
@@ -429,7 +483,7 @@ network={{
         return m.group(1)
 
     def duo_get(self, url):
-        r = sh(*self.ns('airsta', 'curl', '-s', '--max-time', '15', url),
+        r = sh(*self.ns('airsta', 'curl', '-s', '--max-time', '30', url),
                check=False)
         return r.stdout
 
@@ -463,12 +517,17 @@ class FakeMedium:
         ctx.home_channel = 6
         ctx.home_host = '192.168.4.1'
         ctx.home_ping = self.home_ping
+        ctx.home_up = self.home_up
         ctx.home_pmf = None
         ctx.duo_join = self.duo_join
         ctx.duo_get = self.duo_get
         ctx.home_ssid = 'QemuAirPeer'
-        if self.peer.ask(f'ap {ctx.home_ssid} {PSK} 6', r'AIR ap started',
-                         30) is None:
+        self.home_up()
+
+    def home_up(self):
+        # The peer is also the SoftAP's client, as a station only
+        if self.peer.ask(f'ap {self.ctx.home_ssid} {PSK} 6',
+                         r'AIR ap started', 30) is None:
             raise Fail('the peer SoftAP did not start')
 
     def home_ping(self, ip):
@@ -486,7 +545,9 @@ class FakeMedium:
     def duo_get(self, url):
         # The peer app has no HTTP client; a ping shows the data path
         m = self.peer.ask('ping 192.168.4.1 5', r'AIR ping ok=(\d+)', 60)
-        return 'AIR hello' if m and int(m.group(1)) >= 3 else ''
+        if not m or int(m.group(1)) < 3:
+            return ''
+        return 'x' * BIG_LEN if url.endswith('/big') else 'AIR hello'
 
     def teardown(self):
         if self.peer:
@@ -504,7 +565,7 @@ def main():
     p.add_argument('--medium', default='hwsim', choices=['hwsim', 'fake'])
     p.add_argument('--wmediumd', help='wmediumd binary (default: '
                    '~/.local/lib/focal-lab, cuttlefish-common, PATH)')
-    p.add_argument('--tests', default='station,softap')
+    p.add_argument('--tests', default='station,softap,apsta')
     p.add_argument('--qemu-dir', type=Path,
                    default=HERE.parent.parent / 'build')
     p.add_argument('--work', type=Path, default=Path('esp_wifi_work'))
@@ -546,7 +607,8 @@ def main():
         m.setup()
         guest = Guest(ctx, ctx.flash, 'guest', GUEST_MAC, ctx.chardev)
         for name in args.tests.split(','):
-            fn = {'station': t_station, 'softap': t_softap}[name]
+            fn = {'station': t_station, 'softap': t_softap,
+                  'apsta': t_apsta}[name]
             try:
                 results.append((name, True, fn(ctx, guest)))
             except Fail as e:

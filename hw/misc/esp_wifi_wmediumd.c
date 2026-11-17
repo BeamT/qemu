@@ -288,11 +288,18 @@ static void ht40_learn(EspWifiState *s, const uint8_t *f, size_t len)
 }
 
 /*
- * The channel of a frame to or from the BSS addressed by @f: the primary
- * channel of a 40 MHz BSS when the radio is tuned to its centre.
+ * The channel a frame @f travels on. Tuned to the centre of a 40 MHz pair,
+ * the radio sends 20 MHz frames on the pair's primary channel: those of the
+ * 40 MHz BSS they are addressed to, and unicast frames to any other peer,
+ * such as the station's to a 20 MHz access point on the channel where the
+ * SoftAP runs HT40 (the primary is then our SoftAP's, else that of any
+ * 40 MHz BSS centred there). Group frames of no such BSS, i.e. the probe
+ * requests of a scan, which tunes 20 MHz wide and may well land on a centre
+ * channel, and frames when no pair is known go on the radio's channel.
  */
 static uint32_t frame_channel(EspWifiState *s, const uint8_t *f, size_t len)
 {
+    const EspWifiHt40 *pair = NULL;
     unsigned j;
     int a;
 
@@ -307,8 +314,12 @@ static uint32_t frame_channel(EspWifiState *s, const uint8_t *f, size_t len)
                 return e->primary;
             }
         }
+        if (!pair || !memcmp(e->bssid, esp_wifi_own_mac(s, 1), 6)) {
+            pair = e;
+        }
     }
-    return s->channel;
+    return pair && len >= 10 && !wlan_is_group(f + 4) ? pair->primary
+                                                       : s->channel;
 }
 
 /* Does the radio hear @ch: its channel, or either half of a 40 MHz pair */

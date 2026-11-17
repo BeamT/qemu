@@ -208,8 +208,16 @@ give the guest an address outside that range.
 
 - Channel: the guest hears frames on the channel its PLL is tuned to, and
   sends on it. When the driver tunes to the centre of an HT40 pair (the
-  primary channel ±2) it hears frames on both halves, and sends to a BSS it
-  knows to be HT40 on that BSS's primary channel.
+  primary channel ±2) it hears frames on both halves, and sends 20 MHz
+  frames on the primary channel, as the hardware does: those of a BSS it
+  knows to be HT40 on that BSS's primary channel, and unicast frames to any
+  other peer on the primary channel of our SoftAP's pair (else of any HT40
+  BSS centred there). That covers the usual setup case: an HT40 SoftAP on
+  channel 1 (radio on channel 3) while the station joins a 20 MHz access
+  point on channel 1. Group frames of no known HT40 BSS, such as a scan's
+  probe requests (a scan tunes 20 MHz wide, possibly to a channel that is
+  also a centre), go out on the tuned channel. The model learns which pairs
+  exist from the beacons and probe responses it sends and hears.
 - Signal: wmediumd's (from its SNR and link configuration); the TX status
   (acknowledged or not) and the retries also come from wmediumd.
 - Rates: frames are reported at rate index 0 (1 Mbit/s), four tries for
@@ -548,6 +556,7 @@ runs the matrix for each IDF version on every push.
 | --- | --- |
 | `station` | the guest scans and finds the WPA2 network on its channel; a wrong passphrase fails with reason 15 or 204 (handshake), not a timeout; with the right one it gets a DHCP lease, pings the access point host and is pinged by it; on hwsim it negotiates PMF, acts on a protected deauthentication from hostapd and sends one hostapd accepts |
 | `softap` | the guest runs a WPA2 SoftAP on channel 6; a client joins, gets a lease from the guest and fetches `http://192.168.4.1/` (on the fake medium, pings it) |
+| `apsta` | the guest runs its HT40 SoftAP on the home network's channel, so the radio sits on the centre of the pair, and its station joins the home network there, gets a lease and pings the host; then a client joins the SoftAP and fetches 24 KB from `http://192.168.4.1/big`, many TCP segments under the block ack agreement the guest sets up. On hwsim the client has power save on, like a phone, so the guest buffers for it and wakes it with the TIM. On the fake medium the home network and the client are the peer guest, and the fetch is a ping |
 
 Two media:
 

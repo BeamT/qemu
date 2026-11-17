@@ -11,8 +11,12 @@
  *                              run a WPA2 SoftAP (PMF capable, not required)
  *   sta                        back to station only
  *
- * An HTTP server answers GET / on port 80 on every interface. Everything the
- * test looks for is printed on lines starting with "AIR ".
+ * The SoftAP is HT40, so that the radio sits on the centre of a 40 MHz pair
+ * while it runs, also for the station's frames.
+ *
+ * An HTTP server answers GET / on port 80 on every interface, and GET /big
+ * with BIG_LEN bytes, many TCP segments. Everything the test looks for is
+ * printed on lines starting with "AIR ".
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -37,6 +41,7 @@
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
 #define IP_EVENT_ASSIGNED_IP_TO_CLIENT  IP_EVENT_AP_STAIPASSIGNED
 typedef ip_event_ap_staipassigned_t ip_event_assigned_ip_to_client_t;
+#define WIFI_BW40                       WIFI_BW_HT40
 #endif
 
 static SemaphoreHandle_t s_ping_done;
@@ -94,6 +99,25 @@ static esp_err_t http_get(httpd_req_t *req)
 {
     printf("AIR http served\n");
     return httpd_resp_sendstr(req, "AIR hello\n");
+}
+
+#define BIG_LEN     (24 * 1024)
+
+static esp_err_t http_big(httpd_req_t *req)
+{
+    static char chunk[1024];
+
+    for (size_t i = 0; i < sizeof(chunk); i++) {
+        chunk[i] = 'a' + i % 26;
+    }
+    for (int i = 0; i < BIG_LEN / sizeof(chunk); i++) {
+        if (httpd_resp_send_chunk(req, chunk, sizeof(chunk)) != ESP_OK) {
+            printf("AIR http big failed\n");
+            return ESP_FAIL;
+        }
+    }
+    printf("AIR http big served\n");
+    return httpd_resp_send_chunk(req, NULL, 0);
 }
 
 static void scan(void)
@@ -157,6 +181,7 @@ static void softap(const char *ssid, const char *psk, int channel)
     wc.ap.pmf_cfg.required = false;
     esp_wifi_disconnect();
     esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW40);
     printf("AIR ap %s\n", esp_err_to_name(esp_wifi_set_config(WIFI_IF_AP,
                                                                &wc)));
 }
@@ -248,6 +273,8 @@ void app_main(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     httpd_config_t hc = HTTPD_DEFAULT_CONFIG();
     httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = http_get };
+    httpd_uri_t big = { .uri = "/big", .method = HTTP_GET,
+                        .handler = http_big };
     httpd_handle_t srv;
 
     if (nvs_flash_init() != ESP_OK) {
@@ -269,5 +296,6 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(httpd_start(&srv, &hc));
     httpd_register_uri_handler(srv, &root);
+    httpd_register_uri_handler(srv, &big);
     console();
 }
