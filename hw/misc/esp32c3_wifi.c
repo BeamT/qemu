@@ -36,8 +36,13 @@ static const EspWifiMacLayout esp32c3_wifi_layout = {
     .tx_plcp0 = 0xd08,
     .tx_stride = -8,
     .phy_tx_status = 0x1320,
+    .phy_tx_status_stride = -0x4c,
+    .ba_info = 0x1334,
+    .ba_bitmap = 0x1328,
     .int_rx = 0x1004000,
     .dma_base = 0x3fc00000,
+    .key_table = 0x1400,
+    .key_valid = 0x814,
     .status = {
         { 0x084, 0x1, 0x0 },            /* reload RX descriptors */
         { 0xd14, 0x2, 0x1 },            /* TX DMA stop request / idle */
@@ -71,8 +76,13 @@ static const EspWifiMacLayout esp32s3_wifi_layout = {
     .tx_plcp0 = 0xd08,
     .tx_stride = -8,
     .phy_tx_status = 0x1320,
+    .phy_tx_status_stride = -0x4c,
+    .ba_info = 0x1334,
+    .ba_bitmap = 0x1328,
     .int_rx = 0x1004024,
     .dma_base = 0x3fc00000,
+    .key_table = 0x1400,
+    .key_valid = 0x814,
     .status = {
         { 0x084, 0x1, 0x0 },
         { 0xd14, 0x2, 0x1 },
@@ -98,6 +108,8 @@ static bool esp32c3_wifi_mac_reg_known(hwaddr addr)
     }
     switch (addr) {
     case 0x084 ... 0x090:
+    case 0x800 ... 0x814:              /* crypto control, key valid */
+    case 0x1400 ... 0x1400 + ESP_WIFI_KEYS * ESP_WIFI_KEY_ENTRY_SIZE - 1:
     case 0xc3c:
     case 0xc40:
     case 0xca4 ... 0xcb0:
@@ -155,6 +167,10 @@ static uint64_t esp32c3_wifi_radio_read(EspWifiState *s,
         case 0x118:                     /* pending power events */
         case 0x128:
             return 0;
+        case 0x018:                     /* latched TSF, low and high words */
+            return (uint32_t)s->tsf_latch;
+        case 0x01c:
+            return s->tsf_latch >> 32;
         }
     }
     return value;
@@ -176,6 +192,15 @@ static void esp32c3_wifi_radio_write(EspWifiState *s,
         } else if (mhz == 84) {
             esp_wifi_set_channel(s, 14);
         }
+    }
+    /*
+     * TSF: setting bit 1 (TSF 0) or bit 2 (TSF 1) latches the timer into
+     * 0x018/0x01c (hal_mac_tsf_get_time). Both read as the one free-running
+     * microsecond counter; the driver busy-waits on it, so it must advance.
+     * reverse-engineered
+     */
+    if (!strcmp(b->name, "wdev") && addr == 0x00c && (value & 6)) {
+        s->tsf_latch = esp_wifi_tsf(s);
     }
 }
 

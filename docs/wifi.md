@@ -5,7 +5,9 @@ MAC, so that
 unmodified ESP-IDF applications using `esp_wifi` run in QEMU: as a station
 joining an access point, as a SoftAP serving clients, and with ESP-NOW between
 several QEMU instances. Traffic leaves the emulated chip through an ordinary
-QEMU network backend (`user`, `socket`, `dgram`, `tap`...).
+QEMU network backend (`user`, `socket`, `dgram`, `tap`...), or, with the `air`
+property, as real 802.11 frames on a [wmediumd](#real-medium-wmediumd) medium
+shared with `mac80211_hwsim` radios and other emulated chips.
 
 Espressif does not document the Wi-Fi hardware. Everything below was learnt
 by tracing what the IDF driver does in a running guest; the
@@ -155,6 +157,136 @@ Connect the instances with a shared netdev, for example:
 -nic socket,model=misc.esp32_wifi,mcast=230.0.0.1:1234
 ```
 
+## Real medium: wmediumd
+
+With the `air` property the chip's radio joins a
+[wmediumd](https://android.googlesource.com/platform/external/wmediumd)
+medium through its API socket (`wmediumd -a`), next to `mac80211_hwsim`
+radios driven by hostapd and wpa_supplicant, and other QEMU instances. Every
+frame the guest transmits goes to wmediumd as an 802.11 frame, and the guest
+receives what wmediumd delivers to it, so it talks to real WPA2 peers.
+
+```
+wmediumd -u /tmp/vhost.sock -a /tmp/api.sock -c wmediumd.cfg &
+qemu-system-xtensa -nographic -machine esp32s3 ... \
+    -chardev socket,id=air,path=/tmp/api.sock \
+    -global driver=misc.esp32s3_wifi,property=air,value=air \
+    -nic none
+```
+
+| Property | Default | Meaning |
+| --- | --- | --- |
+| `air` | unset | chardev connected to the wmediumd API socket |
+| `air-timeout-ms` | 1000 | How long a frame waits for wmediumd's TX status before it counts as not acknowledged |
+
+With `air` set the device is created without a `-nic`. The emulated access
+points, the emulated SoftAP clients and the ESP-NOW tunnel are off, and the
+`apN-*`, `client-psk` and `ack-timeout-us` properties have no effect. Without
+`air` nothing changes.
+
+### Addresses
+
+wmediumd only carries frames of the stations listed in its configuration,
+and drops the others without a TX status. List the guest's base MAC address
+(its eFuse MAC, used by the station interface):
+
+```
+ifaces : {
+  ids = [ "02:00:00:00:00:00", "02:00:00:00:01:00",   # hwsim radios
+          "02:00:00:00:10:00" ];                      # the guest
+};
+```
+
+The SoftAP address (base + 1) need not be listed: the model registers it
+with `HWSIM_CMD_ADD_MAC_ADDR` when the guest starts using it, and removes it
+on reset. The base MAC must not be the address of a `mac80211_hwsim` radio:
+radio N is `02:00:00:00:NN:00`, so a guest at `02:00:00:00:00:00` collides
+with radio 0. Create one radio more than needed and leave radio 0 down, or
+give the guest an address outside that range.
+
+### What the guest hears and sends
+
+- Channel: the guest hears frames on the channel its PLL is tuned to, and
+  sends on it. When the driver tunes to the centre of an HT40 pair (the
+  primary channel ±2) it hears frames on both halves, and sends to a BSS it
+  knows to be HT40 on that BSS's primary channel.
+- Signal: wmediumd's (from its SNR and link configuration); the TX status
+  (acknowledged or not) and the retries also come from wmediumd.
+- Rates: frames are reported at rate index 0 (1 Mbit/s), four tries for
+  unicast, one for group frames; wmediumd computes airtime and losses from
+  that. The rate the driver chose is not passed on.
+- Beacons: the driver hands the MAC a new SoftAP beacon only about once a
+  second and expects the hardware to repeat it at every target beacon
+  transmission time. The model repeats the last beacon at its beacon interval
+  while the radio is on the SoftAP's channel, with a fresh TSF and sequence
+  number, and stops 3 s after the driver's last one.
+- The TSF field of beacons and probe responses is filled in, as the
+  hardware does.
+- Power save is not modelled: the model clears the power management bit of
+  the frames the guest sends, so that access points do not buffer frames for
+  a station that is in fact always awake.
+- Control frames: Block Ack Request, Block Ack and PS-Poll go over the
+  medium; ACK, RTS and CTS do not (wmediumd models acknowledgements).
+- ESP-NOW frames are ordinary action frames on the medium; this has not
+  been tested.
+
+Every message wmediumd pushes is acknowledged, as its protocol requires. The
+connection can come and go: the model registers when the socket opens, and a
+frame waiting for a TX status when it closes counts as not acknowledged.
+
+### Protected management frames
+
+The guest's station joins networks that offer PMF (`ieee80211w=1`) with PMF
+when `pmf_cfg.capable` is set (the IDF default), and the test checks that
+protected deauthentication frames work in both directions (unicast robust
+management frames are CCMP-encrypted by the model like data). Group
+addressed robust management frames use BIP, which the model does not
+compute or check; see [Encryption](#encryption). Tested on hwsim
+against hostapd 2.10 with `ieee80211w=1`: the association negotiates
+PMF, the guest acts on a protected deauthentication (reason 2) and
+rejoins, and hostapd accepts the guest's own protected deauthentication.
+The guest's SoftAP offers PMF (capable, not required) and a Linux client
+joined it without it; a SoftAP with PMF required has not been tested
+against a Linux client.
+
+### Timing
+
+Measured with ESP-IDF 6.1 on an ESP32-S3 (`tests/esp_wifi/run_air.py`, TCG,
+no `-icount`):
+
+| | `fake_wmediumd.py`, ESP peer | Cuttlefish wmediumd, `mac80211_hwsim` |
+| --- | --- | --- |
+| Station: `esp_wifi_connect()` to IP address | 2.2 s | 4.5 s |
+| SoftAP: client start to DHCP lease | 3.1 s | 10.6 s |
+| SoftAP: authentication request to response | 1–14 ms | 3 ms |
+| SoftAP: association request to response | 14–82 ms | 24 ms |
+| SoftAP: authentication request to 4-way handshake done | | 60 ms |
+
+A Linux station gives an access point about 100 ms per authentication
+attempt, three attempts; the response times above are within that.
+
+Most of the SoftAP time on hwsim is the client's: `wpa_supplicant` got
+the guest's probe response 0.3 s after it started and the guest beaconed
+every 100 ms on channel 6 throughout, but it sent its authentication
+request 10 s later. The station time includes the guest's own scan of
+the 2.4 GHz channels. The figures vary by about a second from run to run
+with host load.
+
+### wmediumd builds
+
+The model uses the API socket messages common to upstream and Android
+wmediumd: `REGISTER`, `ACK` and `NETLINK`, carrying `HWSIM_CMD_FRAME`,
+`HWSIM_CMD_TX_INFO_FRAME`, `HWSIM_CMD_ADD_MAC_ADDR` and
+`HWSIM_CMD_DEL_MAC_ADDR`. The Android build (used by Cuttlefish) also has
+messages 7 to 16 (station list, SNR, position, LCI/civic location, config
+reload, pcap control), which the model does not use. In that build group
+frames reach only the stations that have already transmitted, stations are
+never created on the fly, and `-p` writes timestamps ten times too large
+(its scheduler counts in 100 ns units). It also logs
+`nl: cmd 2, seq ...: Invalid argument` for every frame that reaches a
+`mac80211_hwsim` radio which is down or on another channel; that is
+harmless.
+
 ## Architecture
 
 ```
@@ -164,13 +296,18 @@ Connect the instances with a shared netdev, for example:
                        \                    /
                         hw/misc/esp_wifi.c
      MAC registers, TX slots, RX descriptor chain, interrupts, radio blocks
-                                  |
-                        hw/misc/esp_wifi_air.c
-     emulated APs, SoftAP clients, WPA2 handshake, 802.11 <-> Ethernet,
-     ESP-NOW tunnel
-                                  |
-                           QEMU netdev
+                       /                           \
+       hw/misc/esp_wifi_air.c                 hw/misc/esp_wifi_wmediumd.c
+  emulated APs, SoftAP clients, WPA2     802.11 frames to and from wmediumd,
+  handshake, 802.11 <-> Ethernet,        TX status, channel filter, beacon
+  ESP-NOW tunnel                         repeater; with esp_wifi_ccmp.c:
+              |                          key table, CCMP
+         QEMU netdev                                |
+       (default)                          wmediumd API socket (air=)
 ```
+
+Exactly one medium is active: the wmediumd one when the `air` chardev is set,
+the netdev one otherwise.
 
 `TYPE_ESP_WIFI` is an abstract sysbus device. A chip subclass provides an
 `EspWifiMacLayout` with the offsets the core acts on, a table of radio blocks
@@ -184,10 +321,18 @@ machine maps the regions at the addresses in that table.
 The driver writes a DMA descriptor address with bits 31:30 set into the
 `PLCP0` register of one of five TX slots. The model gathers the frame from the
 descriptor chain, drops the 4 bytes reserved for the FCS (and, for protected
-frames, the 8 bytes reserved for the CCMP MIC), and hands it to the medium.
-Some 20 µs later, or when the ACK arrives or times out, it sets the slot's bit
-in the TX complete register, writes the PHY TX status (`0` acknowledged,
-`0x2300` no ACK) and raises the TX done interrupt.
+frames on the netdev medium, the 8 bytes reserved for the CCMP MIC), and hands
+it to the medium. Some 20 µs later, or when the ACK arrives or times out, it
+sets the slot's bit in the TX complete register, writes the PHY TX status
+(`0` acknowledged, `0x2300` no ACK) and raises the TX done interrupt.
+
+On the ESP32-C3 and ESP32-S3, bits 25:24 of `PLCP0` give the ACK policy:
+0 no ACK, 1 normal ACK, 2 A-MPDU. An A-MPDU has one descriptor per MPDU,
+each starting with an 8-byte subframe header whose first 16-bit word is the
+MPDU length including the FCS. The model sends the MPDUs as separate frames
+and reports which arrived through the block ack registers, as the hardware
+does with the peer's Block Ack; the driver then retransmits only the missing
+ones.
 
 ### Reception
 
@@ -202,10 +347,36 @@ throttles the netdev.
 
 ### Encryption
 
-The model does not encrypt. On a protected link the driver hands frames to
-the MAC with the CCMP header and room for the MIC, and expects received frames
-in the same shape after decryption; the model strips and adds those fields.
-Key material installed by the driver is ignored.
+On a protected link the driver hands frames to the MAC with the Protected bit
+set, the CCMP header (with the packet number) filled in and room for the MIC,
+and expects received frames in the same shape after decryption.
+
+On the netdev medium the model does not encrypt: it strips and adds the CCMP
+header and MIC, and ignores the key material the driver installs, since the
+emulated peers share its view of the keys.
+
+On the wmediumd medium (ESP32-C3 and ESP32-S3) the model encrypts and decrypts
+CCMP-128 for real (IEEE 802.11-2020 12.5.3), with the keys the driver writes
+to the hardware key table, so that real peers can talk to the guest:
+
+- TX: a frame with the Protected bit gets its MIC and encrypted body from the
+  pairwise key of the receiver, or for group frames the group key with the
+  key ID in the CCMP header, preferring the entries of the transmitting
+  interface (STA or SoftAP). Unicast robust management frames (deauth,
+  disassoc, action frames under PMF) are encrypted the same way, with the
+  management flag in the nonce.
+- RX: a protected frame is decrypted with the transmitter's pairwise key or
+  the group key, its MIC checked, and its packet number checked against the
+  last one accepted on that key and TID (management frames count as TID 16).
+  Frames that fail either check are dropped, as the hardware does, and
+  counted in the `esp_wifi_ccmp` and `esp_wifi_ccmp_replay` trace events.
+  Writing a key entry resets its replay counters.
+
+Group addressed management frames under PMF are protected with BIP (a MIC
+element at the end, no Protected bit). The model passes them unchanged in
+both directions; whether the driver computes and checks the BIP MIC itself
+has not been tested. The ESP32 has no modelled key table, so on the wmediumd
+medium it can only use open networks.
 
 ## Register map
 
@@ -267,14 +438,35 @@ modem clock bits.
 | `0x084`–`0x090` | as ESP32 | High |
 | `0xc3c` / `0xc40` | `INT_STATUS` / `INT_CLEAR`; RX cause `0x1004000` | High |
 | `0xca4`–`0xcb0` | TXQ error clear, error, complete clear, complete | Medium |
-| `0xd08 − 8n` | `PLCP0(n)` | Medium |
+| `0x814` | key valid: bit n says key entry n is in use | High |
+| `0xd08 − 8n` | `PLCP0(n)`; bits 25:24 ACK policy: 0 none, 1 normal, 2 A-MPDU | Medium (policy: High) |
 | `0xd14` | TX DMA state, as ESP32 `0xd24` | Medium |
-| `0x1320` | PHY TX status | Medium |
+| `0x1320 − 0x4c·n` | PHY TX status of slot n; bits 15:12 the result: 0 success, 2 ACK timeout (values of 6 and above make the driver assert) | High |
+| `0x1334 − 0x4c·n` | block ack of slot n: bits 15:12 TID, 11:0 starting sequence number | High |
+| `0x1328 − 0x4c·n` / `0x1324 − 0x4c·n` | block ack bitmap of slot n, low / high word: bit k set when SSN + k was received | High |
+| `0x1400 + 0x28·n` | key entry n (n < 32), see below | High (layout), Medium (flags) |
 
 The TX complete (`0xcb0`, cleared through `0xcac`) and PHY TX status
 (`0x1320`) offsets are confirmed by traces of ESP-NOW sends; the TX error
 pair (`0xca4`/`0xca8`) is inferred from the ESP32 ordering and has not been
-seen in use.
+seen in use. The per-slot status and block ack registers come from the
+disassembly of `lmacProcessTxComplete` and `hal_mac_tx_get_blockack` in
+`libpp`, and the model's answers satisfy the driver: with them, A-MPDU
+sessions run without retransmission loops.
+
+A key entry (`hal_sec_set_key` and friends) is ten words:
+
+| Word | Content |
+| --- | --- |
+| 0 | peer address, bytes 0–3 (broadcast for most group keys) |
+| 1 | bits 15:0 peer address bytes 4–5; bit 21 pairwise, bit 23 group, bit 24 interface (0 STA, 1 SoftAP), bits 31:30 key ID |
+| 2–5 | the 128-bit key, little endian |
+| 6–9 | not used by the model |
+
+The layout is confirmed by decrypting captured traffic offline with the keys
+read from these words (every frame of a WPA2 session verified); the meaning
+of the other bits of word 1 (cipher type, presumably) is unknown, and only
+CCMP has been seen.
 
 ### ESP32-C3 radio blocks
 
@@ -285,10 +477,16 @@ seen in use.
 | Analog (RTC I2C) | `0x6000e000` | `0x00`, `0x48` read `0x00ffffff`; `0x50` reads bits 26:24 set; bits 27:20 of a write to `0x150` are the PLL frequency in MHz above 2400, i.e. `7 + 5·ch` | Medium (channel), Low (rest) |
 | NRX | `0x6001c000` | reads `0xffffffff` | Low |
 | BB | `0x6001d000` | reads `0xffffffff` | Low |
-| WDEV | `0x60035000` | stored; `0x07c` returns random data (the RNG data register, as on the ESP32-S3; the PHY library stalls if it reads 0); `0x118`, `0x128` read 0 | Medium (`0x07c`), Low (rest) |
+| WDEV | `0x60035000` | stored; `0x07c` returns random data (the RNG data register, as on the ESP32-S3; the PHY library stalls if it reads 0); `0x118`, `0x128` read 0; setting bit 1 or 2 of `0x00c` latches the TSF (µs) into `0x018` (low) and `0x01c` (high) | Medium (`0x07c`, TSF), Low (rest) |
 
 `SYSCON_WIFI_CLK_EN` (`0x60026014`) and `SYSCON_WIFI_RST_EN` (`0x60026018`)
 read back what was written.
+
+The TSF latch is from the disassembly of `hal_mac_tsf_get_time` (bit 1
+selects TSF 0, bit 2 TSF 1; the model gives both the same free-running
+counter). The SoftAP busy-waits on the TSF while handling a new station; when
+it read 0 the driver took 0.1–0.9 s to answer an authentication request,
+longer than a Linux station waits.
 
 ### ESP32-S3
 
@@ -343,25 +541,68 @@ Every run keeps its serial log, pcap and `-d unimp` log under
 `-icount shift=auto`. The `WifiTests` job in `.github/workflows/build.yml`
 runs the matrix for each IDF version on every push.
 
+`tests/esp_wifi/run_air.py` tests the wmediumd medium with the console app in
+`tests/esp_wifi/apps/air`:
+
+| Test | Pass condition |
+| --- | --- |
+| `station` | the guest scans and finds the WPA2 network on its channel; a wrong passphrase fails with reason 15 or 204 (handshake), not a timeout; with the right one it gets a DHCP lease, pings the access point host and is pinged by it; on hwsim it negotiates PMF, acts on a protected deauthentication from hostapd and sends one hostapd accepts |
+| `softap` | the guest runs a WPA2 SoftAP on channel 6; a client joins, gets a lease from the guest and fetches `http://192.168.4.1/` (on the fake medium, pings it) |
+
+Two media:
+
+- `--medium hwsim` (the default): the Cuttlefish wmediumd with two
+  `mac80211_hwsim` radios in network namespaces, one running hostapd and
+  dnsmasq, the other wpa_supplicant, busybox udhcpc and curl. It needs root,
+  the module and those programs, and is skipped (exit 0, with the reason)
+  when they are missing or `mac80211_hwsim` is already loaded. root has no
+  IDF environment, so build first as yourself:
+
+  ```
+  tests/esp_wifi/run_air.py --idf ~/esp/esp-idf-v6.1 --build-only
+  sudo tests/esp_wifi/run_air.py --idf ~/esp/esp-idf-v6.1 \
+      --wmediumd /usr/lib/cuttlefish-common/bin/wmediumd
+  ```
+
+- `--medium fake`: `tests/esp_wifi/fake_wmediumd.py`, a stand-in for the API
+  socket with wmediumd's delivery rules (configured stations only, TX status
+  with the cookie, every pushed message to be acknowledged), and a second
+  QEMU instance as the peer. No root needed. It reports protocol errors that
+  would crash or abort wmediumd, and writes a pcap of the medium.
+
+Logs, pcaps and wmediumd's output stay in the `/tmp/esp-air-*` directory the
+run prints; `--trace 'esp_wifi_wmd_*'` adds time-stamped QEMU trace events
+to `<guest>.unimp`.
+
 ## Debugging
 
 ```
 -trace 'esp_wifi_*'        # every MAC/radio access, frames, links, handshakes
 -trace 'esp_wifi_[^mr]*'   # frames, channel, links only
+-trace 'esp_wifi_wmd_*'    # wmediumd medium: frames, TX status, addresses
+-trace 'esp_wifi_ccmp*'    # every CCMP operation, MIC and replay failures
 -d unimp                   # MAC registers the model does not know yet
+-msg timestamp=on          # time stamps on trace lines
 ```
 
 ## Known limits
 
-- No radio modelling: no RSSI variation, interference, airtime, or rate
-  adaptation. Frames are delivered after a fixed short delay.
+- No radio modelling on the netdev medium: no RSSI variation,
+  interference, airtime, or rate adaptation. Frames are delivered after a
+  fixed short delay. On the wmediumd medium signal, losses and airtime come
+  from wmediumd, at a fixed 1 Mbit/s rate.
 - One guest station per emulated AP. Up to four emulated SoftAP clients.
 - WPA2-PSK (CCMP) only, plus PSK-SHA256 with PMF for the emulated SoftAP
   clients. No WEP, TKIP or enterprise; the emulated APs do not offer PMF.
-- No 802.11n aggregation, power save buffering or DTIM handling: frames are
-  delivered as soon as they arrive.
+- No power save or DTIM handling: frames are delivered as soon as they
+  arrive, and on the wmediumd medium the guest never announces power save.
+  The emulated APs do not aggregate; on the wmediumd medium A-MPDUs are sent
+  as separate MPDUs and acknowledged through the block ack registers.
 - Frames are not encrypted on the netdev; ESP-NOW with encryption works, but
-  the tunnel carries clear text.
+  the tunnel carries clear text. On the wmediumd medium CCMP-128 is real;
+  GCMP, CCMP-256, TKIP, WEP and BIP are not modelled.
+- The wmediumd medium is 2.4 GHz only, and the ESP32 cannot use encrypted
+  networks on it (no key table model).
 - No WPA3-SAE, so a WPA3-only SoftAP cannot be joined by the emulated
   clients, and the emulated APs offer WPA2-PSK only.
 - Channel decoding relies on the PLL programming sequence; a new PHY library

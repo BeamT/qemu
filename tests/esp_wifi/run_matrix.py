@@ -102,11 +102,15 @@ class Qemu:
                '-drive', f'file={image},if=mtd,format=raw',
                '-drive', f'file={efuse},if=none,format=raw,id=efuse',
                '-global', f'driver={c["efuse"]},property=drive,value=efuse',
-               '-netdev', f'{nic},id=n0',
-               '-net', f'nic,netdev=n0,model={c["wifi"]}',
-               '-object', f'filter-dump,id=f0,netdev=n0,'
-                          f'file={ctx.run_dir / name}.pcap',
                '-d', 'unimp', '-D', str(self.unimp_path)]
+        if nic:
+            cmd += ['-netdev', f'{nic},id=n0',
+                    '-net', f'nic,netdev=n0,model={c["wifi"]}',
+                    '-object', f'filter-dump,id=f0,netdev=n0,'
+                               f'file={ctx.run_dir / name}.pcap']
+        else:
+            # No netdev: the Wi-Fi device gets its medium from @wifi/@extra
+            cmd += ['-nic', 'none']
         if not reboot:
             # A guest reset stops QEMU instead of restarting the chip
             cmd.append('-no-reboot')

@@ -18,6 +18,10 @@
 #define WLAN_FC_TODS            0x0100
 #define WLAN_FC_FROMDS          0x0200
 #define WLAN_FC_PROTECTED       0x4000
+#define WLAN_FC_ORDER           0x8000
+#define WLAN_FC_RETRY           0x0800
+#define WLAN_FC_PWRMGT          0x1000
+#define WLAN_FC_MOREDATA        0x2000
 
 #define WLAN_TYPE_MGMT          0
 #define WLAN_TYPE_CTRL          1
@@ -62,6 +66,46 @@ bool esp_wifi_air_tx(EspWifiState *s, int slot, const uint8_t *frame,
 void esp_wifi_air_rx_eth(EspWifiState *s, const uint8_t *buf, size_t len);
 void esp_wifi_air_channel_changed(EspWifiState *s);
 void esp_wifi_air_ap_changed(EspWifiState *s, int i, Error **errp);
+
+/*
+ * The real wireless medium: frames go to and come from a wmediumd API socket
+ * (esp_wifi_wmediumd.c). When it is in use, the emulated medium above is not.
+ */
+static inline bool esp_wifi_wmd_enabled(EspWifiState *s)
+{
+    return qemu_chr_fe_backend_connected(&s->wmd.chr);
+}
+
+void esp_wifi_wmd_realize(EspWifiState *s, Error **errp);
+void esp_wifi_wmd_reset(EspWifiState *s);
+/*
+ * Send one MPDU of TX slot @slot. If it went out, the slot's pending count
+ * goes up and its TX status arrives later from wmediumd; if it could not be
+ * sent, the slot's ok flag goes down.
+ */
+void esp_wifi_wmd_tx(EspWifiState *s, int slot, const uint8_t *frame,
+                     size_t len);
+
+/*
+ * CCMP done by the MAC with the keys the driver installs in the key table
+ * (esp_wifi_ccmp.c). Frames are complete 802.11 frames without FCS; a
+ * protected frame carries the CCMP header and 8 bytes for the MIC.
+ */
+#define WLAN_CCMP_HDR_LEN       8
+#define WLAN_CCMP_MIC_LEN       8
+
+/* Encrypt in place and fill in the MIC; false if there is no key */
+bool esp_wifi_ccmp_encrypt(EspWifiState *s, uint8_t *frame, size_t len);
+/*
+ * Decrypt in place, leaving the CCMP header and MIC where they are, as the
+ * driver expects; false if there is no key, the MIC is wrong or the frame
+ * is a replay.
+ */
+bool esp_wifi_ccmp_decrypt(EspWifiState *s, uint8_t *frame, size_t len);
+void esp_wifi_keys_written(EspWifiState *s, hwaddr addr);
+void esp_wifi_keys_reset(EspWifiState *s);
+void esp_wifi_keys_free(EspWifiState *s);
+size_t wlan_hdr_len(uint16_t fc);
 
 static inline uint16_t wlan_fc(const uint8_t *f)
 {

@@ -389,6 +389,17 @@ esp_wifi_client_new(uint8_t a0, uint8_t a1, uint8_t a2, uint8_t a3, uint8_t a4, 
 esp_wifi_air_tx(uint32_t channel, size_t len, uint16_t fc) "channel %" PRIu32 " len %zu fc 0x%04x"
 esp_wifi_air_rx(uint8_t channel, size_t len, uint16_t fc) "channel %u len %zu fc 0x%04x"
 
+# esp_wifi_ccmp.c
+esp_wifi_ccmp(const char *dir, int key, int keyid, uint64_t pn, bool ok) "%s key entry %d key ID %d PN %" PRIu64 " ok %d"
+esp_wifi_ccmp_replay(int key, int tid, uint64_t pn, uint64_t last) "key entry %d TID %d PN %" PRIu64 " not after %" PRIu64
+
+# esp_wifi_wmediumd.c
+esp_wifi_wmd_connected(bool up) "connected %d"
+esp_wifi_wmd_addr(bool add, uint8_t a0, uint8_t a1, uint8_t a2, uint8_t a3, uint8_t a4, uint8_t a5) "add %d %02x:%02x:%02x:%02x:%02x:%02x"
+esp_wifi_wmd_tx(int slot, uint64_t cookie, size_t len, uint16_t fc, uint32_t freq) "slot %d cookie %" PRIu64 " len %zu fc 0x%04x freq %" PRIu32
+esp_wifi_wmd_tx_info(int slot, uint64_t cookie, uint32_t flags) "slot %d cookie %" PRIu64 " flags 0x%" PRIx32
+esp_wifi_wmd_rx(size_t len, uint16_t fc, uint32_t freq, int32_t signal) "len %zu fc 0x%04x freq %" PRIu32 " signal %" PRId32
+
 # ov5640.c
 ov5640_write(uint16_t reg, uint8_t value) "reg 0x%04x = 0x%02x"
 ov5640_frame(unsigned width, unsigned height, int quality, unsigned len) "%ux%u at quality %d: %u bytes"

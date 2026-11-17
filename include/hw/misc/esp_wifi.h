@@ -17,6 +17,7 @@
 
 #include "hw/sysbus.h"
 #include "net/net.h"
+#include "chardev/char-fe.h"
 #include "qemu/timer.h"
 #include "qemu/queue.h"
 #include "qom/object.h"
@@ -30,6 +31,13 @@ OBJECT_DECLARE_TYPE(EspWifiState, EspWifiClass, ESP_WIFI)
 #define ESP_WIFI_RADIO_MAX      10
 #define ESP_WIFI_RX_QUEUE_MAX   64
 #define ESP_WIFI_FRAME_MAX      2400
+/* MPDUs in an A-MPDU (the IDF TX block ack window is at most 32) */
+#define ESP_WIFI_AMPDU_MAX      32
+#define ESP_WIFI_TX_BUF         (ESP_WIFI_AMPDU_MAX * ESP_WIFI_FRAME_MAX)
+#define ESP_WIFI_KEYS           32
+#define ESP_WIFI_KEY_ENTRY_SIZE 0x28
+/* Replay counters per key: one per TID, one for management frames */
+#define ESP_WIFI_KEY_RX_PN      17
 
 /* TX done interrupt cause, shared by all supported chips. reverse-engineered */
 #define ESP_WIFI_INT_TX_DONE        0x00000080
@@ -70,9 +78,14 @@ typedef struct EspWifiMacLayout {
     hwaddr plcp1_0;             /* optional; slot 0, [11:0] frame length */
     int plcp1_stride;
     hwaddr phy_tx_status;       /* 0x2300 when no ACK was received */
+    int phy_tx_status_stride;   /* optional; per slot copies */
+    hwaddr ba_info;             /* optional; slot 0 block ack TID and SSN */
+    hwaddr ba_bitmap;           /* slot 0 bitmap bits 31:0, 63:32 below */
     uint32_t mac_ctrl_busy;     /* bits that read back 0 once the MAC stops */
     uint32_t int_rx;            /* cause raised when a frame is received */
     hwaddr dma_base;            /* descriptors hold the low 20 address bits */
+    hwaddr key_table;           /* optional; ESP_WIFI_KEYS entries of 0x28 */
+    hwaddr key_valid;           /* bit n: key entry n in use */
     EspWifiStatusBits status[4];
 } EspWifiMacLayout;
 
@@ -169,7 +182,51 @@ typedef struct EspWifiTxSlot {
     bool busy;
     bool wait_ack;
     int64_t deadline;           /* completion time, or ACK timeout */
+    bool ok;                    /* false: some MPDU could not be sent */
+    unsigned pending;           /* wmediumd: MPDUs waiting for TX status */
+    unsigned n_ampdu;           /* MPDUs in an A-MPDU, 0: not one */
+    uint32_t ba;                /* bit n: MPDU n acknowledged */
+    uint16_t mpdu_seq[ESP_WIFI_AMPDU_MAX];  /* of the MPDUs */
+    uint8_t ampdu_tid;
+    uint64_t cookie;            /* wmediumd: cookie of the last MPDU */
 } EspWifiTxSlot;
+
+/* Model state of a hardware key entry; the key itself lives in the registers */
+typedef struct EspWifiKey {
+    uint64_t rx_pn[ESP_WIFI_KEY_RX_PN];
+    uint8_t aes_key[16];
+    void *aes;                  /* QCryptoCipher for aes_key */
+} EspWifiKey;
+
+/*
+ * A 40 MHz BSS: the PLL is tuned to the centre, but the medium carries its
+ * frames on the primary channel.
+ */
+typedef struct EspWifiHt40 {
+    uint8_t bssid[6];
+    uint8_t primary;            /* 0: unused entry */
+    uint8_t centre;
+} EspWifiHt40;
+
+#define ESP_WIFI_HT40_MAX       8
+
+/* Client of a wmediumd API socket (esp_wifi_wmediumd.c) */
+typedef struct EspWifiWmd {
+    CharBackend chr;
+    bool connected;
+    GByteArray *rx;             /* partial message from wmediumd */
+    uint64_t cookie;
+    uint8_t radio[6];           /* address the frames are sent with */
+    uint8_t extra[2][6];        /* addresses added to the station */
+    bool extra_valid[2];
+    EspWifiHt40 ht40[ESP_WIFI_HT40_MAX];
+    unsigned ht40_next;
+    QEMUTimer *beacon_timer;    /* repeats the SoftAP's beacon */
+    int64_t beacon_last;        /* when the driver last sent one */
+    uint32_t beacon_chan;       /* and on which channel */
+    size_t beacon_len;
+    uint8_t beacon[512];
+} EspWifiWmd;
 
 struct EspWifiState {
     SysBusDevice parent_obj;
@@ -179,6 +236,7 @@ struct EspWifiState {
     qemu_irq irq;
 
     uint32_t *mac_regs;
+    uint8_t *tx_buf;            /* frame or A-MPDU being transmitted */
     unsigned long *unimp_seen;
 
     uint32_t raw_int;
@@ -200,11 +258,16 @@ struct EspWifiState {
     EspWifiClient client[ESP_WIFI_MAX_CLIENTS];
     EspWifiGuestAp guest_ap;
 
+    EspWifiKey keys[ESP_WIFI_KEYS];
+    EspWifiWmd wmd;
+
     NICConf conf;
     NICState *nic;
     char *client_psk;           /* passphrase of the guest's SoftAP */
     uint32_t ack_timeout_us;
     uint32_t beacon_interval_tu;
+    uint32_t air_timeout_ms;
+    uint64_t tsf_latch;         /* TSF snapshot the driver reads back */
 };
 
 struct EspWifiClass {
@@ -233,6 +296,12 @@ struct EspWifiClass {
 void esp_wifi_map(EspWifiState *s,
                   void (*map)(void *opaque, hwaddr base, MemoryRegion *mr),
                   void *opaque);
+
+/*
+ * Create the Wi-Fi device of a machine, or return NULL: when a -nic asks for
+ * @type, or when -global gives the device an air chardev (wmediumd).
+ */
+DeviceState *esp_wifi_create(const char *type);
 
 /* Channel the radio is tuned to, as decoded by the chip's radio_write hook */
 void esp_wifi_set_channel(EspWifiState *s, uint32_t channel);

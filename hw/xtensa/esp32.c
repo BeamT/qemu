@@ -795,7 +795,7 @@ static void esp32_wifi_map_region(void *opaque, hwaddr base, MemoryRegion *mr)
 
 static void esp32_machine_init_wifi(Esp32SocState *ss)
 {
-    DeviceState *dev = qemu_create_nic_device(TYPE_ESP32_WIFI, false, NULL);
+    DeviceState *dev = esp_wifi_create(TYPE_ESP32_WIFI);
 
     if (!dev) {
         return;

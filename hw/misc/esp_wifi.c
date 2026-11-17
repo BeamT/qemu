@@ -5,7 +5,8 @@
  * the TX slots, the RX descriptor chain, the interrupt cause registers and a
  * set of radio register blocks that only need to accept the PHY calibration
  * sequence. Frames are handed to esp_wifi_air.c, which emulates the rest of
- * the wireless medium.
+ * the wireless medium, or to esp_wifi_wmediumd.c, which puts them on the
+ * medium simulated by wmediumd.
  *
  * Based on the ESP32 Wi-Fi emulation by Martin Johnson, its port to the
  * espressif/qemu tree by redfast00 and the ESP32-C3 port by
@@ -26,6 +27,7 @@
 #include "qapi/visitor.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
+#include "hw/qdev-properties-system.h"
 #include "migration/vmstate.h"
 #include "exec/address-spaces.h"
 #include "sysemu/dma.h"
@@ -43,7 +45,7 @@
 #define TX_START            0xc0000000u
 #define TX_LATENCY_NS       (20 * SCALE_US)
 #define RX_RETRY_NS         (1 * SCALE_MS)
-#define TX_MAX_DESCRIPTORS  8
+#define TX_MAX_DESCRIPTORS  ESP_WIFI_AMPDU_MAX
 
 static inline EspWifiClass *esp_wifi_get_class(EspWifiState *s)
 {
@@ -98,7 +100,9 @@ void esp_wifi_set_channel(EspWifiState *s, uint32_t channel)
     }
     trace_esp_wifi_channel(s->channel, channel);
     s->channel = channel;
-    esp_wifi_air_channel_changed(s);
+    if (!esp_wifi_wmd_enabled(s)) {
+        esp_wifi_air_channel_changed(s);
+    }
 }
 
 /* RX path: hand frames to the guest through its descriptor chain */
@@ -205,8 +209,12 @@ void esp_wifi_deliver(EspWifiState *s, const uint8_t *frame, size_t len,
         trace_esp_wifi_rx_drop(len, 0);
         return;
     }
-    /* The frame is followed by an FCS, which the driver ignores */
-    f = g_malloc0(sizeof(*f) + len + WLAN_FCS_LEN);
+    /*
+     * The frame is followed by an FCS, which the driver ignores. Short
+     * control frames get room for a whole header, which the RX control
+     * header code looks into.
+     */
+    f = g_malloc0(sizeof(*f) + MAX(len, WLAN_HDR_LEN) + WLAN_FCS_LEN);
     f->rssi = rssi;
     f->len = len + WLAN_FCS_LEN;
     memcpy(f->data, frame, len);
@@ -245,9 +253,36 @@ static void esp_wifi_rx_reload(EspWifiState *s)
 
 /* TX path */
 
+/*
+ * The block ack of an A-MPDU, where the driver reads it after a successful
+ * transmission (hal_mac_tx_get_blockack): TID and starting sequence number,
+ * and a 64 bit bitmap with bit n set when sequence number SSN + n arrived.
+ */
+static void esp_wifi_tx_block_ack(EspWifiState *s, int slot)
+{
+    const EspWifiMacLayout *l = layout(s);
+    EspWifiTxSlot *t = &s->tx[slot];
+    hwaddr off = slot * l->phy_tx_status_stride;
+    uint16_t ssn = t->mpdu_seq[0];
+    uint64_t bitmap = 0;
+    unsigned i;
+
+    for (i = 0; i < t->n_ampdu; i++) {
+        unsigned n = (t->mpdu_seq[i] - ssn) & 0xfff;
+
+        if ((t->ba & BIT(i)) && n < 64) {
+            bitmap |= BIT_ULL(n);
+        }
+    }
+    *mac_reg(s, l->ba_info + off) = deposit32(ssn, 12, 4, t->ampdu_tid);
+    *mac_reg(s, l->ba_bitmap + off) = bitmap;
+    *mac_reg(s, l->ba_bitmap - 4 + off) = bitmap >> 32;
+}
+
 void esp_wifi_tx_complete(EspWifiState *s, int slot, bool acked)
 {
     const EspWifiMacLayout *l = layout(s);
+    uint32_t status;
 
     if (!s->tx[slot].busy) {
         return;
@@ -258,10 +293,22 @@ void esp_wifi_tx_complete(EspWifiState *s, int slot, bool acked)
 
     /*
      * The IDF driver gets a TX done interrupt in both cases and tells them
-     * apart by the PHY TX status. reverse-engineered
+     * apart by the PHY TX status, a copy per slot. Bits 15:12 are the
+     * result: 0 success, 2 ACK timeout (lmacProcessTxComplete).
      */
-    *mac_reg(s, l->phy_tx_status) = acked ? ESP_WIFI_PHY_TX_ACK
-                                          : ESP_WIFI_PHY_TX_NO_ACK;
+    status = acked ? ESP_WIFI_PHY_TX_ACK : ESP_WIFI_PHY_TX_NO_ACK;
+    if (s->tx[slot].n_ampdu && l->ba_info) {
+        /* A block ack came back if any MPDU arrived */
+        esp_wifi_tx_block_ack(s, slot);
+        status = s->tx[slot].ba ? ESP_WIFI_PHY_TX_ACK : ESP_WIFI_PHY_TX_NO_ACK;
+    }
+    if (l->phy_tx_status_stride) {
+        *mac_reg(s, l->phy_tx_status + slot * l->phy_tx_status_stride) =
+            status;
+    }
+    if (!slot || !l->phy_tx_status_stride) {
+        *mac_reg(s, l->phy_tx_status) = status;
+    }
     *mac_reg(s, l->txq_complete) |= BIT(slot);
     esp_wifi_raise(s, ESP_WIFI_INT_TX_DONE);
 }
@@ -292,21 +339,39 @@ static void esp_wifi_ack_timer(void *opaque)
 
     for (i = 0; i < ESP_WIFI_TX_SLOTS; i++) {
         if (s->tx[i].busy && s->tx[i].deadline <= now) {
-            esp_wifi_tx_complete(s, i, !s->tx[i].wait_ack);
+            bool acked = !s->tx[i].wait_ack && s->tx[i].ok;
+
+            if (!acked) {
+                s->tx[i].ba = 0;
+            }
+            esp_wifi_tx_complete(s, i, acked);
         }
     }
     esp_wifi_tx_rearm(s);
 }
 
+/*
+ * PLCP0 bits 25:24: 0 for frames that expect no ACK, 1 for frames that
+ * expect one, 2 for an A-MPDU. The descriptors of an A-MPDU hold one MPDU
+ * each, after an 8 byte subframe header whose first 16 bits are the MPDU
+ * length including the FCS. reverse-engineered
+ */
+#define TX_ACK_BLOCK        2
+#define AMPDU_HDR_LEN       8
+
 static void esp_wifi_tx_start(EspWifiState *s, int slot, uint32_t plcp0)
 {
     const EspWifiMacLayout *l = layout(s);
-    uint8_t frame[ESP_WIFI_FRAME_MAX];
+    uint8_t *frame = s->tx_buf;
     uint32_t addr = dma_addr(s, plcp0);
     uint32_t plcp1 = l->plcp1_0 ?
                      *mac_reg(s, l->plcp1_0 + slot * l->plcp1_stride) : 0;
+    unsigned ack_mode = extract32(plcp0, 24, 2);
+    size_t off[TX_MAX_DESCRIPTORS], dlen[TX_MAX_DESCRIPTORS];
+    size_t mpdu_off[TX_MAX_DESCRIPTORS], mpdu_len[TX_MAX_DESCRIPTORS];
+    unsigned n_desc = 0, n_mpdu, i;
+    bool ampdu = ack_mode == TX_ACK_BLOCK, wait = false;
     size_t len = 0;
-    int i;
 
     if (s->tx[slot].busy) {
         qemu_log_mask(LOG_GUEST_ERROR, "esp_wifi: TX slot %d already busy\n",
@@ -314,7 +379,7 @@ static void esp_wifi_tx_start(EspWifiState *s, int slot, uint32_t plcp0)
         return;
     }
 
-    for (i = 0; i < TX_MAX_DESCRIPTORS && addr; i++) {
+    while (n_desc < TX_MAX_DESCRIPTORS && addr) {
         uint32_t desc[3];
         uint32_t n;
 
@@ -323,9 +388,11 @@ static void esp_wifi_tx_start(EspWifiState *s, int slot, uint32_t plcp0)
             break;
         }
         desc[0] = le32_to_cpu(desc[0]);
-        n = MIN(DESC_LENGTH(desc[0]), sizeof(frame) - len);
+        n = MIN(DESC_LENGTH(desc[0]), ESP_WIFI_TX_BUF - len);
         address_space_read(&address_space_memory, le32_to_cpu(desc[1]),
                            MEMTXATTRS_UNSPECIFIED, frame + len, n);
+        off[n_desc] = len;
+        dlen[n_desc++] = n;
         len += n;
         if ((desc[0] & DESC_EOF) || !desc[2]) {
             break;
@@ -333,13 +400,65 @@ static void esp_wifi_tx_start(EspWifiState *s, int slot, uint32_t plcp0)
         addr = dma_addr(s, le32_to_cpu(desc[2]));
     }
 
+    /* Each MPDU of an A-MPDU, or the whole frame */
+    for (i = 0; ampdu && i < n_desc; i++) {
+        size_t m = dlen[i] >= AMPDU_HDR_LEN ?
+                   lduw_le_p(frame + off[i]) : 0;
+
+        if (m < WLAN_FCS_LEN || m + AMPDU_HDR_LEN > dlen[i]) {
+            ampdu = false;
+        }
+        mpdu_off[i] = off[i] + AMPDU_HDR_LEN;
+        mpdu_len[i] = m;
+    }
+    if (ampdu) {
+        n_mpdu = n_desc;
+    } else {
+        n_mpdu = 1;
+        mpdu_off[0] = 0;
+        mpdu_len[0] = len;
+    }
+
     trace_esp_wifi_tx(slot, len, extract32(plcp1, 0, 12),
-                      len >= 2 ? wlan_fc(frame) : 0);
-    /* The length includes room for the FCS, which the MAC computes */
-    len = len > WLAN_FCS_LEN ? len - WLAN_FCS_LEN : 0;
+                      mpdu_len[0] >= 2 ? wlan_fc(frame + mpdu_off[0]) : 0);
     s->tx[slot].busy = true;
     s->tx[slot].wait_ack = false;
-    if (len >= 10 && esp_wifi_air_tx(s, slot, frame, len)) {
+    s->tx[slot].ok = true;
+    s->tx[slot].pending = 0;
+    s->tx[slot].n_ampdu = ampdu ? n_mpdu : 0;
+    /* Media other than wmediumd acknowledge all or nothing */
+    s->tx[slot].ba = MAKE_64BIT_MASK(0, n_mpdu);
+    for (i = 0; i < n_mpdu; i++) {
+        /* The length includes room for the FCS, which the MAC computes */
+        size_t n = mpdu_len[i] > WLAN_FCS_LEN ? mpdu_len[i] - WLAN_FCS_LEN
+                                              : 0;
+
+        if (n < 10) {
+            continue;
+        }
+        if (n > ESP_WIFI_FRAME_MAX) {
+            qemu_log_mask(LOG_GUEST_ERROR, "esp_wifi: %zu byte frame too "
+                          "long, dropped\n", n);
+            s->tx[slot].ok = false;
+            s->tx[slot].ba &= ~BIT(i);
+            continue;
+        }
+        if (ampdu && n >= WLAN_HDR_LEN + 2) {
+            s->tx[slot].mpdu_seq[i] = lduw_le_p(frame + mpdu_off[i] + 22) >> 4;
+            s->tx[slot].ampdu_tid = frame[mpdu_off[i] + WLAN_HDR_LEN] & 0xf;
+        }
+        if (esp_wifi_wmd_enabled(s)) {
+            esp_wifi_wmd_tx(s, slot, frame + mpdu_off[i], n);
+        } else {
+            wait |= esp_wifi_air_tx(s, slot, frame + mpdu_off[i], n);
+        }
+    }
+    if (s->tx[slot].pending) {
+        /* Wait for wmediumd's TX status, but not forever */
+        s->tx[slot].wait_ack = true;
+        s->tx[slot].deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                               (int64_t)s->air_timeout_ms * SCALE_MS;
+    } else if (wait) {
         s->tx[slot].wait_ack = true;
         s->tx[slot].deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                                (int64_t)s->ack_timeout_us * SCALE_US;
@@ -413,6 +532,7 @@ static void esp_wifi_mac_write(void *opaque, hwaddr addr, uint64_t value,
     trace_esp_wifi_mac_write(addr, value);
     esp_wifi_check_known(s, addr, true);
     *mac_reg(s, addr) = value;
+    esp_wifi_keys_written(s, addr);
 
     if (addr == l->rx_base) {
         s->rx_cur = value ? dma_addr(s, value) : 0;
@@ -549,7 +669,12 @@ static void esp_wifi_reset_hold(Object *obj, ResetType type)
     esp_wifi_rx_purge(s);
     timer_del(s->rx_timer);
     timer_del(s->ack_timer);
-    esp_wifi_air_reset(s);
+    esp_wifi_keys_reset(s);
+    if (esp_wifi_wmd_enabled(s)) {
+        esp_wifi_wmd_reset(s);
+    } else {
+        esp_wifi_air_reset(s);
+    }
     qemu_set_irq(s->irq, 0);
 }
 
@@ -563,6 +688,7 @@ static void esp_wifi_realize(DeviceState *dev, Error **errp)
 
     assert(k->n_radio <= ESP_WIFI_RADIO_MAX);
     s->mac_regs = g_malloc0(l->size);
+    s->tx_buf = g_malloc(ESP_WIFI_TX_BUF);
     s->unimp_seen = bitmap_new(l->size / 4);
     memory_region_init_io(&s->mac_iomem, OBJECT(dev), &esp_wifi_mac_ops, s,
                           "esp-wifi.mac", l->size);
@@ -586,6 +712,11 @@ static void esp_wifi_realize(DeviceState *dev, Error **errp)
     QSIMPLEQ_INIT(&s->rx_queue);
     s->rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp_wifi_rx_timer, s);
     s->ack_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp_wifi_ack_timer, s);
+    if (esp_wifi_wmd_enabled(s)) {
+        /* No emulated peers, and no netdev: everything goes to wmediumd */
+        esp_wifi_wmd_realize(s, errp);
+        return;
+    }
     esp_wifi_air_realize(s, errp);
     if (*errp) {
         return;
@@ -616,6 +747,8 @@ static void esp_wifi_finalize(Object *obj)
 {
     EspWifiState *s = ESP_WIFI(obj);
     int i;
+
+    esp_wifi_keys_free(s);
 
     for (i = 0; i < ESP_WIFI_MAX_APS; i++) {
         g_free(s->ap[i].ssid);
@@ -743,7 +876,7 @@ static void esp_wifi_set_ap(Object *obj, Visitor *v, const char *name,
         visit_type_bool(v, name, &ap->dhcp, errp);
         return;
     }
-    if (DEVICE(obj)->realized) {
+    if (DEVICE(obj)->realized && !esp_wifi_wmd_enabled(s)) {
         esp_wifi_air_ap_changed(s, i, errp);
     }
 }
@@ -754,6 +887,8 @@ static Property esp_wifi_properties[] = {
     DEFINE_PROP_UINT32("ack-timeout-us", EspWifiState, ack_timeout_us, 20000),
     DEFINE_PROP_UINT32("beacon-interval", EspWifiState, beacon_interval_tu,
                        100),
+    DEFINE_PROP_CHR("air", EspWifiState, wmd.chr),
+    DEFINE_PROP_UINT32("air-timeout-ms", EspWifiState, air_timeout_ms, 1000),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -788,6 +923,25 @@ static void esp_wifi_class_init(ObjectClass *klass, void *data)
                                                   ap_props[p].desc);
         }
     }
+}
+
+DeviceState *esp_wifi_create(const char *type)
+{
+    DeviceState *dev = qemu_create_nic_device(type, false, NULL);
+
+    if (dev) {
+        return dev;
+    }
+    /*
+     * No -nic for this model. The device still exists if -global gave it a
+     * chardev for wmediumd, so that it can be used with -nic none.
+     */
+    dev = qdev_new(type);
+    if (!esp_wifi_wmd_enabled(ESP_WIFI(dev))) {
+        object_unref(OBJECT(dev));
+        return NULL;
+    }
+    return dev;
 }
 
 static const TypeInfo esp_wifi_info = {

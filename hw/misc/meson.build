@@ -150,6 +150,8 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
 system_ss.add(when: 'CONFIG_ESP_WIFI', if_true: files(
   'esp_wifi.c',
   'esp_wifi_air.c',
+  'esp_wifi_ccmp.c',
+  'esp_wifi_wmediumd.c',
   'esp32_wifi.c',
   'esp32c3_wifi.c',
 ))
